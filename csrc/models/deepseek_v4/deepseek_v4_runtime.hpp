@@ -70,9 +70,4 @@ infinicore::Tensor int8_gemm(const infinicore::Tensor &input,
                              const infinicore::Tensor &weight,
                              const infinicore::Tensor &weight_scale);
 
-// One TN int4 expert. packed is [N, K/2], scale is [N, 1], activation is [M, K].
-infinicore::Tensor w4a8_matmul(const infinicore::Tensor &activation,
-                               const infinicore::Tensor &packed,
-                               const infinicore::Tensor &scale);
-
 } // namespace infinilm::models::deepseek_v4

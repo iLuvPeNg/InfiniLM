@@ -5,11 +5,13 @@
 
 #include "infinicore/ops/add.hpp"
 #include "infinicore/ops/distributed/allreduce.hpp"
-#include "infinicore/ops/matmul.hpp"
 #include "infinicore/ops/mul_scalar.hpp"
+#include "infinicore/ops/per_channel_quant_i8.hpp"
+#include "infinicore/ops/w4a8_group_gemm.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -225,36 +227,36 @@ infinicore::Tensor DeepseekV4MoE::forward(infinicore::Tensor hidden, const std::
     auto acc = infinicore::Tensor::zeros({tokens, hidden_}, dtype, device);
     const size_t rows = routes.size();
     if (rows > 0) {
-        size_t cursor = 0;
-        while (cursor < rows) {
-            size_t end = cursor + 1;
-            while (end < rows && routes[end].local == routes[cursor].local) {
-                ++end;
+        const size_t local_experts = w1_packed_->size(0);
+        std::vector<int32_t> counts(local_experts, 0);
+        auto packed_act = infinicore::Tensor::empty({rows, hidden_}, dtype, device);
+        for (size_t i = 0; i < rows; ++i) {
+            if (routes[i].local >= local_experts) {
+                throw std::runtime_error("deepseek_v4 moe: local expert index out of range");
             }
-            const size_t local_index = routes[cursor].local;
-            const size_t count = end - cursor;
-            auto act = infinicore::Tensor::empty({count, hidden_}, dtype, device);
-            for (size_t i = 0; i < count; ++i) {
-                act->narrow({{0, i, 1}})->view({hidden_})->copy_from(x->narrow({{0, routes[cursor + i].token, 1}})->contiguous()->view({hidden_}));
-            }
-            auto w1 = w1_packed_->narrow({{0, local_index, 1}})->contiguous()->view({intermediate_, hidden_ / 2});
-            auto s1 = w1_scale_packed_->narrow({{0, local_index, 1}})->contiguous()->view({intermediate_, size_t{1}});
-            auto w3 = w3_packed_->narrow({{0, local_index, 1}})->contiguous()->view({intermediate_, hidden_ / 2});
-            auto s3 = w3_scale_packed_->narrow({{0, local_index, 1}})->contiguous()->view({intermediate_, size_t{1}});
-            auto gate = w4a8_matmul(act, w1, s1);
-            auto up = w4a8_matmul(act, w3, s3);
-            auto mid = swiglu_clamp(gate, up, swiglu_limit_);
-            auto w2 = w2_packed_->narrow({{0, local_index, 1}})->contiguous()->view({hidden_, intermediate_ / 2});
-            auto s2 = w2_scale_packed_->narrow({{0, local_index, 1}})->contiguous()->view({hidden_, size_t{1}});
-            auto down = w4a8_matmul(mid, w2, s2);
-            for (size_t i = 0; i < count; ++i) {
-                auto row = down->narrow({{0, i, 1}})->contiguous()->view({hidden_});
-                auto scaled = infinicore::op::mul_scalar(row, static_cast<double>(routes[cursor + i].weight));
-                const size_t token = routes[cursor + i].token;
-                auto dst = acc->narrow({{0, token, 1}})->contiguous()->view({hidden_});
-                acc->narrow({{0, token, 1}})->view({hidden_})->copy_from(infinicore::op::add(dst, scaled));
-            }
-            cursor = end;
+            counts[routes[i].local] += 1;
+            packed_act->narrow({{0, i, 1}})->view({hidden_})->copy_from(x->narrow({{0, routes[i].token, 1}})->contiguous()->view({hidden_}));
+        }
+        auto tokens_per_experts = upload_i32(counts, {local_experts}, infinicore::Device::cpu());
+        auto act_i8 = infinicore::Tensor::empty({rows, hidden_}, infinicore::DataType::I8, device);
+        auto act_scale = infinicore::Tensor::empty({rows, size_t{1}}, infinicore::DataType::F32, device);
+        infinicore::op::per_channel_quant_i8_(packed_act, act_i8, act_scale);
+        auto gate = infinicore::Tensor::empty({rows, intermediate_}, dtype, device);
+        auto up = infinicore::Tensor::empty({rows, intermediate_}, dtype, device);
+        infinicore::op::w4a8_group_gemm_(gate, act_i8, w1_packed_->contiguous(), act_scale, w1_scale_packed_->contiguous(), tokens_per_experts);
+        infinicore::op::w4a8_group_gemm_(up, act_i8, w3_packed_->contiguous(), act_scale, w3_scale_packed_->contiguous(), tokens_per_experts);
+        auto mid = swiglu_clamp(gate, up, swiglu_limit_);
+        auto mid_i8 = infinicore::Tensor::empty({rows, intermediate_}, infinicore::DataType::I8, device);
+        auto mid_scale = infinicore::Tensor::empty({rows, size_t{1}}, infinicore::DataType::F32, device);
+        infinicore::op::per_channel_quant_i8_(mid, mid_i8, mid_scale);
+        auto down = infinicore::Tensor::empty({rows, hidden_}, dtype, device);
+        infinicore::op::w4a8_group_gemm_(down, mid_i8, w2_packed_->contiguous(), mid_scale, w2_scale_packed_->contiguous(), tokens_per_experts);
+        for (size_t i = 0; i < rows; ++i) {
+            auto row = down->narrow({{0, i, 1}})->contiguous()->view({hidden_});
+            auto scaled = infinicore::op::mul_scalar(row, static_cast<double>(routes[i].weight));
+            const size_t token = routes[i].token;
+            auto dst = acc->narrow({{0, token, 1}})->contiguous()->view({hidden_});
+            acc->narrow({{0, token, 1}})->view({hidden_})->copy_from(infinicore::op::add(dst, scaled));
         }
     }
     if (tp_size_ > 1 && comm_ != nullptr) {
