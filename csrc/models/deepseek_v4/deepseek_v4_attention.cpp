@@ -5,8 +5,10 @@
 
 #include "infinicore/ops/cat.hpp"
 #include "infinicore/ops/distributed/allreduce.hpp"
-#include "infinicore/ops/dsa.hpp"
+#include "infinicore/ops/matmul.hpp"
+#include "infinicore/ops/mul_scalar.hpp"
 #include "infinicore/ops/rms_norm.hpp"
+#include "infinicore/ops/softmax.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -15,6 +17,25 @@
 #include <string>
 
 namespace infinilm::models::deepseek_v4 {
+namespace {
+
+infinicore::Tensor attend_heads(const infinicore::Tensor &query_heads,
+                                const infinicore::Tensor &keys,
+                                float scale,
+                                const infinicore::Tensor &sink) {
+    const size_t heads = query_heads->size(0);
+    const size_t rows = keys->size(0);
+    auto scores = infinicore::op::matmul(query_heads, keys->permute({1, 0})->contiguous());
+    auto scores_f = infinicore::op::mul_scalar(cast_dtype(scores, infinicore::DataType::F32), static_cast<double>(scale));
+    auto sink_col = cast_dtype(sink, infinicore::DataType::F32)->view({heads, size_t{1}});
+    auto logits = infinicore::op::cat({scores_f, sink_col}, 1);
+    auto probs = infinicore::Tensor::empty(logits->shape(), infinicore::DataType::F32, logits->device());
+    infinicore::op::softmax_(probs, logits, 1);
+    auto kept = cast_dtype(probs->narrow({{1, 0, rows}})->contiguous(), query_heads->dtype());
+    return infinicore::op::matmul(kept, keys);
+}
+
+} // namespace
 
 DeepseekV4Compressor::DeepseekV4Compressor(size_t hidden_size,
                                            size_t head_dim,
@@ -277,25 +298,28 @@ infinicore::Tensor DeepseekV4Attention::forward(infinicore::Tensor hidden,
         throw std::runtime_error("deepseek_v4 attention: no keys for FlashMLA");
     }
     auto packed = infinicore::Tensor::empty({packed_rows, head_dim_}, dtype, device);
-    std::vector<int32_t> indices(tokens * max_k, 0);
-    std::vector<int32_t> lens(tokens, 0);
+    std::vector<size_t> starts(tokens, 0);
+    std::vector<size_t> lens(tokens, 0);
     size_t cursor = 0;
     for (size_t t = 0; t < tokens; ++t) {
-        lens[t] = static_cast<int32_t>(keys[t].size());
+        starts[t] = cursor;
+        lens[t] = keys[t].size();
         for (size_t k = 0; k < keys[t].size(); ++k) {
             const auto &key = keys[t][k];
             const auto cache = key.first == 0 ? swa_cache : cache_slot(layer_idx_, kCompressedCacheSlot);
             copy_last_row(packed, cursor, cache, key.second);
-            indices[t * max_k + k] = static_cast<int32_t>(cursor);
             ++cursor;
         }
     }
     auto query = q->contiguous();
-    auto kv_cache = packed->view({packed_rows, size_t{1}, head_dim_});
-    auto index_tensor = upload_i32(indices, {tokens, size_t{1}, max_k}, device);
-    auto len_tensor = upload_i32(lens, {tokens}, device);
+    auto sink = attn_sink_->contiguous();
     auto attn = infinicore::Tensor::empty({tokens, local_heads_, head_dim_}, dtype, device);
-    infinicore::op::sparse_flash_mla_(attn, query, kv_cache, index_tensor, len_tensor, scale_, attn_sink_->contiguous());
+    for (size_t t = 0; t < tokens; ++t) {
+        auto q_t = query->narrow({{0, t, 1}})->contiguous()->view({local_heads_, head_dim_});
+        auto k_t = packed->narrow({{0, starts[t], lens[t]}})->contiguous()->view({lens[t], head_dim_});
+        auto out_t = attend_heads(q_t, k_t, scale_, sink);
+        attn->narrow({{0, t, 1}})->view({local_heads_, head_dim_})->copy_from(out_t);
+    }
 
     auto mixed = apply_rope(attn, positions, rope_cache_, head_dim_ - rope_dim_, rope_dim_, true);
     const size_t heads_per_group = local_heads_ / local_groups_;

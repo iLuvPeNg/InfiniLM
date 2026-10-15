@@ -65,9 +65,14 @@ infinicore::Tensor swiglu_clamp(const infinicore::Tensor &gate,
                                 const infinicore::Tensor &up,
                                 float limit);
 
-// Iluvatar int8 GEMM. weight is [N, K], weight_scale is [N, 1], input is [M, K].
+// Native infiniop int8 GEMM. weight is [N, K], weight_scale is [N, 1], input is [M, K].
 infinicore::Tensor int8_gemm(const infinicore::Tensor &input,
                              const infinicore::Tensor &weight,
                              const infinicore::Tensor &weight_scale);
+
+// One TN int4 expert. packed is [N, K/2], scale is [N, 1], activation is [M, K].
+infinicore::Tensor w4a8_matmul(const infinicore::Tensor &activation,
+                               const infinicore::Tensor &packed,
+                               const infinicore::Tensor &scale);
 
 } // namespace infinilm::models::deepseek_v4

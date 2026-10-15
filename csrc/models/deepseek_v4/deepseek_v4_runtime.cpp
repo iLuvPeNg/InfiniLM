@@ -4,13 +4,13 @@
 #include "infinicore/ops/add.hpp"
 #include "infinicore/ops/cast.hpp"
 #include "infinicore/ops/cat.hpp"
-#include "infinicore/ops/dynamic_scaled_int8_quant.hpp"
 #include "infinicore/ops/embedding.hpp"
 #include "infinicore/ops/fmin.hpp"
+#include "infinicore/ops/linear_w8a8i8.hpp"
 #include "infinicore/ops/matmul.hpp"
 #include "infinicore/ops/mul.hpp"
 #include "infinicore/ops/mul_scalar.hpp"
-#include "infinicore/ops/scaled_mm_w8a8.hpp"
+#include "infinicore/ops/per_channel_quant_i8.hpp"
 #include "infinicore/ops/sigmoid.hpp"
 #include "infinicore/ops/silu.hpp"
 #include "infinicore/ops/sum.hpp"
@@ -404,6 +404,21 @@ infinicore::Tensor hc_head(const infinicore::Tensor &residual,
     return out;
 }
 
+std::vector<int8_t> download_i8(const infinicore::Tensor &x) {
+    sync_device();
+    auto cpu = x->to(infinicore::Device::cpu())->contiguous();
+    sync_device();
+    if (cpu->dtype() != infinicore::DataType::I8) {
+        throw std::runtime_error("deepseek_v4: expected an int8 tensor");
+    }
+    const auto *ptr = reinterpret_cast<const int8_t *>(cpu->data());
+    return std::vector<int8_t>(ptr, ptr + cpu->numel());
+}
+
+int8_t wrap_int8(int value) {
+    return static_cast<int8_t>(static_cast<uint8_t>(value));
+}
+
 infinicore::Tensor int8_gemm(const infinicore::Tensor &input,
                              const infinicore::Tensor &weight,
                              const infinicore::Tensor &weight_scale) {
@@ -411,17 +426,63 @@ infinicore::Tensor int8_gemm(const infinicore::Tensor &input,
     if (x->ndim() != 2) {
         throw std::runtime_error("deepseek_v4 int8 gemm expects a 2D activation");
     }
-    auto w = weight->contiguous();
-    auto scale = weight_scale->contiguous();
+    return infinicore::op::linear_w8a8i8(x, weight->contiguous(), weight_scale->contiguous(), std::nullopt);
+}
+
+infinicore::Tensor w4a8_matmul(const infinicore::Tensor &activation,
+                               const infinicore::Tensor &packed,
+                               const infinicore::Tensor &scale) {
+    auto x = activation->contiguous();
+    auto w = packed->contiguous();
+    auto w_scale = scale->contiguous();
+    if (x->ndim() != 2 || w->ndim() != 2 || w_scale->ndim() != 2) {
+        throw std::runtime_error("deepseek_v4 w4a8 matmul expects 2D tensors");
+    }
     const size_t rows = x->size(0);
     const size_t k = x->size(1);
     const size_t n = w->size(0);
+    const size_t k_packed = w->size(1);
+    if (k_packed * 2 != k || k_packed % 16 != 0) {
+        throw std::runtime_error("deepseek_v4 w4a8 matmul: packed K does not match the activation");
+    }
+    if (w_scale->numel() != n) {
+        throw std::runtime_error("deepseek_v4 w4a8 matmul: scale length does not match N");
+    }
     auto x_i8 = infinicore::Tensor::empty({rows, k}, infinicore::DataType::I8, x->device());
     auto x_scale = infinicore::Tensor::empty({rows, size_t{1}}, infinicore::DataType::F32, x->device());
-    infinicore::op::dynamic_scaled_int8_quant_(x_i8, x, x_scale);
-    auto out = infinicore::Tensor::empty({rows, n}, x->dtype(), x->device());
-    infinicore::op::scaled_mm_w8a8_(out, x_i8, w, x_scale, scale, std::nullopt, true);
-    return out;
+    infinicore::op::per_channel_quant_i8_(x, x_i8, x_scale);
+    const auto q = download_i8(x_i8);
+    const auto qs = download_f32(x_scale);
+    std::vector<float> act(rows * k);
+    for (size_t row = 0; row < rows; ++row) {
+        for (size_t col = 0; col < k; ++col) {
+            act[row * k + col] = static_cast<float>(q[row * k + col]) * qs[row];
+        }
+    }
+    const auto bytes = download_i8(w);
+    const auto ws = download_f32(w_scale);
+    std::vector<float> weight(n * k);
+    for (size_t row = 0; row < n; ++row) {
+        for (size_t group = 0; group < k_packed / 16; ++group) {
+            for (size_t i = 0; i < 16; ++i) {
+                const uint8_t byte = static_cast<uint8_t>(bytes[row * k_packed + group * 16 + i]);
+                int lo = byte & 0x0F;
+                int hi = (byte >> 4) & 0x0F;
+                if (lo >= 8) {
+                    lo -= 16;
+                }
+                if (hi >= 8) {
+                    hi -= 16;
+                }
+                const size_t base = row * k + group * 32;
+                weight[base + i] = static_cast<float>(wrap_int8(lo * 18)) * ws[row];
+                weight[base + 16 + i] = static_cast<float>(wrap_int8(hi * 18)) * ws[row];
+            }
+        }
+    }
+    auto a = cast_dtype(upload_f32(act, {rows, k}, x->device()), x->dtype());
+    auto b = cast_dtype(upload_f32(weight, {n, k}, x->device()), x->dtype());
+    return infinicore::op::matmul(a, b->permute({1, 0})->contiguous());
 }
 
 infinicore::Tensor swiglu_clamp(const infinicore::Tensor &gate,
