@@ -12,7 +12,7 @@
 
 namespace infinilm::models::deepseek_v4 {
 
-// BF16 compressor. overlap (coff=2) is used when compress_ratio == 4.
+// The compressor keeps a BF16 state. Overlap (`coff` = 2) is used when `compress_ratio` is 4.
 class DeepseekV4Compressor : public infinicore::nn::Module {
 public:
     DeepseekV4Compressor(size_t hidden_size,
@@ -55,12 +55,13 @@ class DeepseekV4Attention : public infinicore::nn::Module {
 public:
     DeepseekV4Attention(std::shared_ptr<infinilm::config::ModelConfig> model_config,
                         const infinicore::Device &device,
-                        int compress_ratio);
+                        int compress_ratio,
+                        size_t layer_idx);
 
     infinicore::Tensor forward(infinicore::Tensor hidden, const std::vector<int64_t> &positions) const;
 
 private:
-    static constexpr size_t kMaxPos = 4096;
+    size_t layer_idx_{0};
     size_t local_heads_{0};
     size_t head_dim_{0};
     size_t rope_dim_{0};
@@ -73,9 +74,6 @@ private:
     double rope_theta_{10000.0};
     double compress_rope_theta_{160000.0};
     float scale_{1.0f};
-    mutable infinicore::Tensor swa_cache_;
-    mutable infinicore::Tensor state_cache_;
-    mutable infinicore::Tensor compressed_cache_;
     mutable infinicore::Tensor rope_cache_;
     mutable infinicore::Tensor compress_rope_cache_;
     mutable std::vector<uint8_t> compressed_valid_;

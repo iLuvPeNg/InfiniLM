@@ -1,7 +1,7 @@
 #include "deepseek_v4_moe.hpp"
 
-#include "deepseek_v4_runtime.hpp"
 #include "../../global_state/global_state.hpp"
+#include "deepseek_v4_runtime.hpp"
 
 #include "infinicore/ops/add.hpp"
 #include "infinicore/ops/distributed/allreduce.hpp"
@@ -237,8 +237,7 @@ infinicore::Tensor DeepseekV4MoE::forward(infinicore::Tensor hidden, const std::
         auto packed_scale = infinicore::Tensor::empty({rows, size_t{1}}, infinicore::DataType::F32, device);
         for (size_t i = 0; i < rows; ++i) {
             packed_x->narrow({{0, i, 1}})->view({hidden_})->copy_from(x_i8->narrow({{0, routes[i].token, 1}})->contiguous()->view({hidden_}));
-            packed_scale->narrow({{0, i, 1}})->view({size_t{1}})->copy_from(
-                x_scale->narrow({{0, routes[i].token, 1}})->contiguous()->view({size_t{1}}));
+            packed_scale->narrow({{0, i, 1}})->view({size_t{1}})->copy_from(x_scale->narrow({{0, routes[i].token, 1}})->contiguous()->view({size_t{1}}));
         }
         auto tokens_per_expert = upload_i32(counts, {local}, infinicore::Device::cpu());
         auto gate = infinicore::Tensor::empty({rows, intermediate_}, dtype, device);
