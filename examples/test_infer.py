@@ -101,9 +101,14 @@ def test(
     print("=================== start generate ====================")
 
     try:
-        outputs = model.chat(
-            messages=conversations,
-        )
+        try:
+            outputs = model.chat(
+                messages=conversations,
+            )
+        except ValueError as err:
+            if "chat_template" not in str(err):
+                raise
+            outputs = model.generate(prompts)
     finally:
         model.close()
     t2 = time.time()

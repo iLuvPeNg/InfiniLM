@@ -4,6 +4,7 @@
 #include "infinicore/ops/distributed/send_recv.hpp"
 #include <spdlog/spdlog.h>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace infinilm::engine {
 
@@ -348,7 +349,9 @@ void RankWorker::thread_loop() {
             // Execute job outside the lock
             if (local_cmd == Command::LOAD) {
                 try {
-                    model_->load_parameter(local_param_name, local_param);
+                    if (!model_->try_load_parameter(local_param_name, local_param)) {
+                        model_->load_parameter(local_param_name, local_param);
+                    }
                 } catch (const std::exception &e) {
                     {
                         std::lock_guard<std::mutex> lk(mutex_);
@@ -369,7 +372,13 @@ void RankWorker::thread_loop() {
 
             } else if (local_cmd == Command::LOAD_BATCH) {
                 try {
-                    model_->load_parameters_no_sync(local_params, local_params_strict);
+                    std::unordered_map<std::string, infinicore::Tensor> regular_params;
+                    for (const auto &entry : local_params) {
+                        if (!model_->try_load_parameter(entry.first, entry.second)) {
+                            regular_params.emplace(entry.first, entry.second);
+                        }
+                    }
+                    model_->load_parameters_no_sync(regular_params, local_params_strict);
                     infinicore::context::syncStream();
                 } catch (const std::exception &e) {
                     {

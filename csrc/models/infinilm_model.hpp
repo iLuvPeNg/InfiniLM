@@ -68,6 +68,13 @@ public:
 
     virtual ~InfinilmModel() = default;
     virtual Output forward(const Input &input) const = 0;
+    // Routed-expert checkpoints name every expert. Return true when this model
+    // consumed the tensor, including ranks that do not own that expert.
+    virtual bool try_load_parameter(const std::string &name, const infinicore::Tensor &param) {
+        (void)name;
+        (void)param;
+        return false;
+    }
     virtual void reset_cache(const cache::CacheConfig *cache_config);
     virtual const cache::CacheConfig *get_cache_config() const {
         return cache_config_.get();

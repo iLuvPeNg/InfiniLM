@@ -12,6 +12,28 @@ from safetensors import safe_open
 from tqdm import tqdm
 
 
+_DEEPSEEK_V4_FP32_SUFFIXES = (
+    ".weight_scale",
+    ".attn_sink",
+    ".hc_attn_fn",
+    ".hc_attn_base",
+    ".hc_attn_scale",
+    ".hc_ffn_fn",
+    ".hc_ffn_base",
+    ".hc_ffn_scale",
+    ".hc_head_fn",
+    ".hc_head_base",
+    ".hc_head_scale",
+    ".ape",
+    ".bias",
+)
+
+# Routed experts are packed per rank. Their checkpoint names are not module parameters.
+_ROUTED_EXPERT_KEY = re.compile(
+    r"^(?:layers|mtp)\.\d+\.ffn\.experts\.\d+\.w[123]\.(?:weight|weight_scale)$"
+)
+
+
 def _get_scale_emb(model_path: str) -> float:
     config_path = os.path.join(model_path, "config.json")
     if not os.path.exists(config_path):
@@ -128,7 +150,10 @@ def load_state_dict(
 
         for k in f.keys():
             tensor = f.get_tensor(k)
-            preserve_fp32 = k.endswith(preserve_fp32_suffixes)
+            preserve_fp32 = any(
+                k == suffix.lstrip(".") or k.endswith(suffix)
+                for suffix in preserve_fp32_suffixes
+            )
             if tensor.is_floating_point() and not preserve_fp32:
                 tensor = tensor.to(device=device, dtype=dtype)
             else:
@@ -204,6 +229,8 @@ def load_model_state_dict_by_file(
     preserve_fp32_suffixes = (".e_score_correction_bias",)
     if model_type == "kimi_k3":
         preserve_fp32_suffixes += (".A_log", ".dt_bias")
+    if model_type == "deepseek_v4":
+        preserve_fp32_suffixes += _DEEPSEEK_V4_FP32_SUFFIXES
 
     torch_device = "cpu"
     torch_dtype = infinicore.utils.to_torch_dtype(dtype)
@@ -269,6 +296,12 @@ def load_model_state_dict_by_file(
                     if key in model_key_set
                 }
 
+            expert_param = {}
+            if model_type == "deepseek_v4":
+                for key in list(model_param.keys()):
+                    if _ROUTED_EXPERT_KEY.match(key):
+                        expert_param[key] = model_param.pop(key)
+
             already_loaded_keys.extend(model_param.keys())
 
             # --------------------------------------------------------- #
@@ -278,9 +311,17 @@ def load_model_state_dict_by_file(
             for key in model_param.keys():
                 model_param_infini[key] = infinicore.from_torch(model_param[key])
             model.load_state_dict(model_param_infini, strict=False)
+            if expert_param:
+                expert_infini = {
+                    key: infinicore.from_torch(value)
+                    for key, value in expert_param.items()
+                }
+                model.load_state_dict(expert_infini, strict=False)
+                del expert_infini
             infinicore.sync_device()
             del model_param_infini
             del model_param
+            del expert_param
             gc.collect()
         if not (
             "lm_head.weight" in model_keys
