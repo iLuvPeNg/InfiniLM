@@ -4,6 +4,7 @@
 #include "deepseek_v4_common.hpp"
 #include "infinicore/context/context.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -55,14 +56,16 @@ std::vector<infinicore::Tensor> deepseek_v4_allocate_kv_cache_tensors(
     }
 
     const size_t num_layers = text_config->get<size_t>("num_hidden_layers");
+    const size_t mtp_layers = static_cast<size_t>(std::max(text_config->get_or<int>("num_hash_layers", 0), 0));
+    const size_t total_layers = num_layers + mtp_layers;
     const size_t head_dim = text_config->get<size_t>("head_dim");
     const size_t capacity = cache_capacity(cache_config);
     const auto ratios = text_config->get_config_json().at("compress_ratios").get<std::vector<int>>();
     const auto &device = global_state::get_tensor_model_parallel_rank_info().device;
     const auto dtype = text_config->get_dtype();
 
-    std::vector<infinicore::Tensor> kv_cache_vec(num_layers * kKvCachesPerLayer);
-    for (size_t layer = 0; layer < num_layers; ++layer) {
+    std::vector<infinicore::Tensor> kv_cache_vec(total_layers * kKvCachesPerLayer);
+    for (size_t layer = 0; layer < total_layers; ++layer) {
         const size_t base = layer * kKvCachesPerLayer;
         kv_cache_vec[base + kSwaCacheSlot] = infinicore::Tensor::zeros({capacity, head_dim}, dtype, device);
         const int ratio = layer < ratios.size() ? ratios[layer] : 0;

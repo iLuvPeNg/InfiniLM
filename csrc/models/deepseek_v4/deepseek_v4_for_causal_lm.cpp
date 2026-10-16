@@ -5,6 +5,11 @@
 #include "deepseek_v4_allocate_kv_cache_tensors.hpp"
 #include "deepseek_v4_runtime.hpp"
 
+#include "infinicore/ops/cat.hpp"
+#include "infinicore/ops/mul_scalar.hpp"
+#include "infinicore/ops/random_sample.hpp"
+#include "infinicore/ops/sum.hpp"
+
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -112,6 +117,11 @@ DeepseekV4ForCausalLM::DeepseekV4ForCausalLM(std::shared_ptr<infinilm::config::M
             n_layers + static_cast<size_t>(i),
             kind));
     }
+    dspark_block_size_ = model_config->get_or<int>("dspark_block_size", 0);
+    dspark_noise_token_ = model_config->get_or<int>("dspark_noise_token_id", 0);
+    if (model_config->get_config_json().contains("dspark_target_layer_ids")) {
+        dspark_target_layers_ = model_config->get_config_json().at("dspark_target_layer_ids").get<std::vector<int>>();
+    }
 }
 
 infinilm::InfinilmModel::Output DeepseekV4ForCausalLM::forward(const Input &input) const {
@@ -135,11 +145,22 @@ infinilm::InfinilmModel::Output DeepseekV4ForCausalLM::forward(const Input &inpu
         hidden = hidden->view({hidden->numel() / hidden->size(hidden->ndim() - 1), hidden->size(hidden->ndim() - 1)});
     }
     infinicore::Tensor residual = hidden;
+    std::vector<infinicore::Tensor> target_hidden;
+    size_t next_target = 0;
     for (size_t i = 0; i < layers_.size(); ++i) {
         try {
             residual = layers_[i]->forward(residual, positions, token_ids);
         } catch (const std::exception &err) {
             throw std::runtime_error("deepseek_v4 layer " + std::to_string(i) + ": " + err.what());
+        }
+        if (next_target < dspark_target_layers_.size() && static_cast<int>(i) == dspark_target_layers_[next_target]) {
+            if (residual->ndim() == 2) {
+                target_hidden.push_back(residual);
+            } else {
+                auto summed = infinicore::op::sum(residual, {1}, false);
+                target_hidden.push_back(infinicore::op::mul_scalar(summed, 1.0 / static_cast<double>(residual->size(1))));
+            }
+            ++next_target;
         }
     }
     const double rms_eps = model_config_->get<double>("rms_norm_eps");
@@ -147,7 +168,43 @@ infinilm::InfinilmModel::Output DeepseekV4ForCausalLM::forward(const Input &inpu
     auto collapsed = hc_head(residual, hc_head_fn_, hc_head_scale_, hc_head_base_, rms_eps, hc_eps);
     auto normed = norm_->forward(collapsed);
     auto logits = head_->forward(normed)->contiguous();
-    return {logits->view({size_t{1}, token_ids.size(), logits->size(logits->ndim() - 1)})};
+    auto logits_view = logits->view({size_t{1}, token_ids.size(), logits->size(logits->ndim() - 1)});
+    infinicore::Tensor draft_ids = infinicore::Tensor::empty({size_t{0}}, infinicore::DataType::I64, infinicore::Device::cpu());
+    const bool run_dspark = !input.sample_all_positions && dspark_block_size_ > 0 && mtp_.size() >= 3 && target_hidden.size() == dspark_target_layers_.size();
+    if (run_dspark) {
+        auto main_hidden = target_hidden.size() == 1 ? target_hidden[0] : infinicore::op::cat(target_hidden, 1);
+        auto main_x = mtp_.front()->combine_main(main_hidden);
+        for (const auto &layer : mtp_) {
+            layer->cache_draft_context(main_x, positions);
+        }
+        if (token_ids.size() == 1) {
+            const size_t vocab = logits->size(logits->ndim() - 1);
+            auto row = logits->narrow({{0, token_ids.size() - 1, 1}})->contiguous()->view({vocab});
+            auto index = infinicore::Tensor::empty({size_t{1}}, infinicore::DataType::I64, row->device())->view({});
+            infinicore::op::random_sample_(index, row, 0.0f, 1.0f, 1, 1.0f);
+            const int64_t anchor = download_i64(index).at(0);
+            std::vector<int64_t> block_ids(static_cast<size_t>(dspark_block_size_), dspark_noise_token_);
+            std::vector<int64_t> block_positions(static_cast<size_t>(dspark_block_size_));
+            block_ids[0] = anchor;
+            for (int i = 0; i < dspark_block_size_; ++i) {
+                block_positions[static_cast<size_t>(i)] = positions.back() + 1 + i;
+            }
+            auto block_tokens = infinicore::Tensor::empty({block_ids.size()}, infinicore::DataType::I64, infinicore::Device::cpu());
+            std::memcpy(block_tokens->data(), block_ids.data(), block_ids.size() * sizeof(int64_t));
+            block_tokens = block_tokens->to(hidden->device());
+            auto block_hidden = embed_->forward(block_tokens)->contiguous();
+            if (block_hidden->ndim() == 3) {
+                block_hidden = block_hidden->view({block_hidden->numel() / block_hidden->size(block_hidden->ndim() - 1), block_hidden->size(block_hidden->ndim() - 1)});
+            }
+            for (const auto &layer : mtp_) {
+                block_hidden = layer->forward(block_hidden, block_positions, block_ids);
+            }
+            const auto sampled = mtp_.back()->sample_dspark_block(block_hidden, anchor, dspark_block_size_, *head_);
+            draft_ids = infinicore::Tensor::empty({sampled.size()}, infinicore::DataType::I64, infinicore::Device::cpu());
+            std::memcpy(draft_ids->data(), sampled.data(), sampled.size() * sizeof(int64_t));
+        }
+    }
+    return {logits_view, draft_ids};
 }
 
 void DeepseekV4ForCausalLM::reset_cache(const cache::CacheConfig *cache_config) {

@@ -27,6 +27,9 @@ private:
     INFINICORE_NN_PARAMETER(hc_head_fn);
     INFINICORE_NN_PARAMETER(hc_head_base);
     INFINICORE_NN_PARAMETER(hc_head_scale);
+    std::vector<int> dspark_target_layers_;
+    int dspark_block_size_{0};
+    int64_t dspark_noise_token_{0};
     std::vector<std::shared_ptr<DeepseekV4DecoderLayer>> layers_;
     std::vector<std::shared_ptr<DeepseekV4DecoderLayer>> mtp_;
 };

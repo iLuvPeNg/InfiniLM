@@ -59,6 +59,9 @@ public:
                         size_t layer_idx);
 
     infinicore::Tensor forward(infinicore::Tensor hidden, const std::vector<int64_t> &positions) const;
+    // Write this layer's sliding-window KV for `hidden` at `positions`.
+    // DSpark prefill uses the projected target hidden here and skips the block.
+    void cache_context_kv(infinicore::Tensor hidden, const std::vector<int64_t> &positions) const;
 
 private:
     size_t layer_idx_{0};

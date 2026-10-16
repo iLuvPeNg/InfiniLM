@@ -5,6 +5,7 @@
 
 #include "infinicore/ops/cat.hpp"
 #include "infinicore/ops/distributed/allreduce.hpp"
+#include "infinicore/ops/flash_mla.hpp"
 #include "infinicore/ops/matmul.hpp"
 #include "infinicore/ops/mul_scalar.hpp"
 #include "infinicore/ops/rms_norm.hpp"
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -314,11 +316,21 @@ infinicore::Tensor DeepseekV4Attention::forward(infinicore::Tensor hidden,
     auto query = q->contiguous();
     auto sink = attn_sink_->contiguous();
     auto attn = infinicore::Tensor::empty({tokens, local_heads_, head_dim_}, dtype, device);
-    for (size_t t = 0; t < tokens; ++t) {
-        auto q_t = query->narrow({{0, t, 1}})->contiguous()->view({local_heads_, head_dim_});
-        auto k_t = packed->narrow({{0, starts[t], lens[t]}})->contiguous()->view({lens[t], head_dim_});
-        auto out_t = attend_heads(q_t, k_t, scale_, sink);
-        attn->narrow({{0, t, 1}})->view({local_heads_, head_dim_})->copy_from(out_t);
+    if (device.getType() == infinicore::Device::Type::ILUVATAR) {
+        std::vector<int32_t> row_starts(tokens);
+        std::vector<int32_t> row_lens(tokens);
+        for (size_t t = 0; t < tokens; ++t) {
+            row_starts[t] = static_cast<int32_t>(starts[t]);
+            row_lens[t] = static_cast<int32_t>(lens[t]);
+        }
+        infinicore::op::flash_mla_(attn, query, packed, sink, scale_, row_starts, row_lens);
+    } else {
+        for (size_t t = 0; t < tokens; ++t) {
+            auto q_t = query->narrow({{0, t, 1}})->contiguous()->view({local_heads_, head_dim_});
+            auto k_t = packed->narrow({{0, starts[t], lens[t]}})->contiguous()->view({lens[t], head_dim_});
+            auto out_t = attend_heads(q_t, k_t, scale_, sink);
+            attn->narrow({{0, t, 1}})->view({local_heads_, head_dim_})->copy_from(out_t);
+        }
     }
 
     auto mixed = apply_rope(attn, positions, rope_cache_, head_dim_ - rope_dim_, rope_dim_, true);
@@ -339,6 +351,31 @@ infinicore::Tensor DeepseekV4Attention::forward(infinicore::Tensor hidden,
         infinicore::op::distributed::allreduce_(out, out, INFINICCL_SUM, rank_info.comm);
     }
     return out;
+}
+
+void DeepseekV4Attention::cache_context_kv(infinicore::Tensor hidden,
+                                           const std::vector<int64_t> &positions) const {
+    auto x = hidden->contiguous();
+    const size_t tokens = x->size(0);
+    if (tokens != positions.size()) {
+        throw std::runtime_error("deepseek_v4 attention: position count does not match tokens");
+    }
+    auto swa_cache = cache_slot(layer_idx_, kSwaCacheSlot);
+    const size_t cache_len = swa_cache->size(0);
+    for (int64_t pos : positions) {
+        if (pos < 0 || static_cast<size_t>(pos) >= cache_len) {
+            throw std::runtime_error("deepseek_v4 attention: `position` is outside the KV cache");
+        }
+    }
+    const auto device = x->device();
+    auto kv = kv_norm_->forward(int8_gemm(x, wkv_->weight(), wkv_->weight_scale()))->contiguous();
+    if (!rope_cache_ || rope_cache_->size(0) != cache_len) {
+        rope_cache_ = make_rope_cache(cache_len, rope_dim_, rope_theta_, device);
+    }
+    kv = apply_rope(kv, positions, rope_cache_, head_dim_ - rope_dim_, rope_dim_, false);
+    for (size_t t = 0; t < tokens; ++t) {
+        copy_last_row(swa_cache, static_cast<size_t>(positions[t]), kv, t);
+    }
 }
 
 } // namespace infinilm::models::deepseek_v4

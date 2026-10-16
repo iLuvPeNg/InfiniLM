@@ -16,6 +16,8 @@ public:
     DeepseekV4MarkovHead(size_t vocab_size,
                          const infinicore::DataType &dtype,
                          const infinicore::Device &device);
+    infinicore::Tensor embed(int64_t token) const;
+    infinicore::Tensor bias(const infinicore::Tensor &embed) const;
 
 private:
     INFINICORE_NN_MODULE(infinilm::nn::Linear, markov_w1);
@@ -27,6 +29,7 @@ public:
     DeepseekV4ConfidenceHead(size_t in_features,
                              const infinicore::DataType &dtype,
                              const infinicore::Device &device);
+    infinicore::Tensor score(const infinicore::Tensor &hidden, const infinicore::Tensor &embed) const;
 
 private:
     INFINICORE_NN_MODULE(infinilm::nn::Linear, proj);
@@ -49,6 +52,13 @@ public:
     infinicore::Tensor forward(infinicore::Tensor residual,
                                const std::vector<int64_t> &positions,
                                const std::vector<int64_t> &token_ids) const;
+    infinicore::Tensor combine_main(infinicore::Tensor hidden) const;
+    void cache_draft_context(const infinicore::Tensor &main_x,
+                             const std::vector<int64_t> &positions) const;
+    std::vector<int64_t> sample_dspark_block(infinicore::Tensor residual,
+                                             int64_t anchor_token,
+                                             int block_size,
+                                             const infinilm::nn::Linear &lm_head) const;
 
 private:
     int hc_mult_{4};

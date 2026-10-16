@@ -221,6 +221,9 @@ class ModelRunner:
         if self.speculative_runner is not None:
             return self._model_forward_with_speculative(scheduler_output, model_input)
 
+        if self._use_deepseek_dspark(scheduler_output):
+            return self._deepseek_dspark_forward(scheduler_output, model_input)
+
         # Wake every stage before stage 0 enters forward. Each worker receives
         # the same metadata and then blocks in its model on the activation from
         # the preceding stage. Stage 0 waits for all acknowledgements afterward.
@@ -243,6 +246,73 @@ class ModelRunner:
 
     def _model_forward_with_speculative(self, scheduler_output, model_input):
         return self.speculative_runner.forward(scheduler_output, model_input)
+
+    def _use_deepseek_dspark(self, scheduler_output):
+        return (
+            self.model_engine.model_type == "deepseek_v4"
+            and self.config.top_k == 1
+            and scheduler_output.num_requests == 1
+            and not scheduler_output.is_prefill
+        )
+
+    def _deepseek_dspark_forward(self, scheduler_output, model_input):
+        # The target forward also runs the DSpark block. `hidden_states` carries
+        # the drafted token ids, starting with the target's own next token.
+        # Greedy verification keeps the accepted prefix and one corrected token.
+        # forward_raw defaults sample_all_positions to True, which skips DSpark.
+        raw = self.model_engine.forward_raw(**model_input, sample_all_positions=False)
+        sampled = raw["output_ids"].to_numpy().tolist()
+        draft_tensor = raw["hidden_states"]
+        if draft_tensor is None or draft_tensor.numel() == 0:
+            return sampled
+        draft = [int(token) for token in draft_tensor.to_numpy().reshape(-1).tolist()]
+        if not draft or not sampled or draft[0] != int(sampled[0]):
+            return sampled
+
+        req = scheduler_output.scheduled_requests[0]
+        base_len = req.get_total_length()
+        verify = self.model_engine.forward_raw(
+            input_ids=infinicore.from_list([draft], dtype=infinicore.int64),
+            position_ids=infinicore.from_list(
+                list(range(base_len, base_len + len(draft))),
+                dtype=infinicore.int64,
+            ),
+            past_kv_lengths=infinicore.from_list([base_len], dtype=infinicore.int32),
+            total_kv_lengths=infinicore.from_list(
+                [base_len + len(draft)], dtype=infinicore.int32
+            ),
+            input_offsets=infinicore.from_list([0, len(draft)], dtype=infinicore.int32),
+            cu_seqlens=infinicore.from_list(
+                [0, base_len + len(draft)], dtype=infinicore.int32
+            ),
+            sample_all_positions=True,
+            temperature=1.0,
+            top_k=1,
+            top_p=1.0,
+        )
+        verify_ids = [
+            int(token) for token in verify["output_ids"].to_numpy().reshape(-1).tolist()
+        ]
+        if len(verify_ids) < len(draft):
+            return sampled
+
+        accepted = 1
+        correction = None
+        for idx in range(1, len(draft)):
+            expected = verify_ids[idx - 1]
+            if draft[idx] != expected:
+                correction = expected
+                break
+            accepted += 1
+        if correction is None:
+            correction = verify_ids[len(draft) - 1]
+        output_tokens = draft[:accepted] + [correction]
+        max_tokens = req.sampling_params.max_tokens
+        if max_tokens is not None:
+            remaining = max_tokens - req.get_num_generated_tokens()
+            if remaining > 0:
+                output_tokens = output_tokens[:remaining]
+        return [output_tokens]
 
     @contextmanager
     def maybe_get_kv_connector_output(
