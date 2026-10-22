@@ -1,4 +1,6 @@
 import logging
+import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Generator
@@ -260,7 +262,14 @@ class ModelRunner:
         # the drafted token ids, starting with the target's own next token.
         # Greedy verification keeps the accepted prefix and one corrected token.
         # forward_raw defaults sample_all_positions to True, which skips DSpark.
+        metric_timer = os.environ.get("INFINI_METRIC_TIMER")
+        metric_start = time.perf_counter() if metric_timer else 0.0
         raw = self.model_engine.forward_raw(**model_input, sample_all_positions=False)
+        if metric_timer:
+            print(
+                f"METRIC_MTP target_plus_draft_ms {(time.perf_counter() - metric_start) * 1000.0:.3f}",
+                flush=True,
+            )
         sampled = raw["output_ids"].to_numpy().tolist()
         draft_tensor = raw["hidden_states"]
         if draft_tensor is None or draft_tensor.numel() == 0:
@@ -271,6 +280,7 @@ class ModelRunner:
 
         req = scheduler_output.scheduled_requests[0]
         base_len = req.get_total_length()
+        verify_start = time.perf_counter() if metric_timer else 0.0
         verify = self.model_engine.forward_raw(
             input_ids=infinicore.from_list([draft], dtype=infinicore.int64),
             position_ids=infinicore.from_list(
@@ -290,6 +300,11 @@ class ModelRunner:
             top_k=1,
             top_p=1.0,
         )
+        if metric_timer:
+            print(
+                f"METRIC_MTP verify_ms {(time.perf_counter() - verify_start) * 1000.0:.3f}",
+                flush=True,
+            )
         verify_ids = [
             int(token) for token in verify["output_ids"].to_numpy().reshape(-1).tolist()
         ]

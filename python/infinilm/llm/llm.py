@@ -154,7 +154,17 @@ class LLMEngine:
         if scheduler_output is None:
             return False, []
 
+        metric_timer = os.environ.get("INFINI_METRIC_TIMER")
+        metric_start = time.perf_counter() if metric_timer else 0.0
         runner_output = self.model_runner.execute_model(scheduler_output)
+        if metric_timer and scheduler_output.scheduled_requests:
+            tokens = 0
+            for req in scheduler_output.scheduled_requests:
+                tokens += req.get_prompt_length() if scheduler_output.is_prefill else 1
+            print(
+                f"METRIC_E2E {'prefill' if scheduler_output.is_prefill else 'decode'} tokens {tokens} ms {(time.perf_counter() - metric_start) * 1000.0:.3f}",
+                flush=True,
+            )
         sampled_token_ids = runner_output.sampled_token_ids
         self.scheduler.update_from_output(runner_output)
         pending = self._update_requests(

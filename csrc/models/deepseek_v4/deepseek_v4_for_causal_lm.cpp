@@ -5,11 +5,14 @@
 #include "deepseek_v4_allocate_kv_cache_tensors.hpp"
 #include "deepseek_v4_runtime.hpp"
 
+#include "infinicore/context/context.hpp"
 #include "infinicore/ops/cat.hpp"
 #include "infinicore/ops/mul_scalar.hpp"
 #include "infinicore/ops/random_sample.hpp"
 #include "infinicore/ops/sum.hpp"
 
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -147,6 +150,19 @@ infinilm::InfinilmModel::Output DeepseekV4ForCausalLM::forward(const Input &inpu
     infinicore::Tensor residual = hidden;
     std::vector<infinicore::Tensor> target_hidden;
     size_t next_target = 0;
+    const bool time_decode = std::getenv("INFINI_METRIC_TIMER") != nullptr && token_ids.size() == 1;
+    if (time_decode) {
+        infinicore::context::syncStream();
+    }
+    const auto metric_stamp = std::chrono::steady_clock::now();
+    auto metric_lap = [&]() {
+        if (!time_decode) {
+            return 0.0;
+        }
+        infinicore::context::syncStream();
+        const auto now = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(now - metric_stamp).count();
+    };
     for (size_t i = 0; i < layers_.size(); ++i) {
         try {
             residual = layers_[i]->forward(residual, positions, token_ids);
@@ -163,12 +179,14 @@ infinilm::InfinilmModel::Output DeepseekV4ForCausalLM::forward(const Input &inpu
             ++next_target;
         }
     }
+    const double metric_layers = metric_lap();
     const double rms_eps = model_config_->get<double>("rms_norm_eps");
     const double hc_eps = model_config_->get<double>("hc_eps");
     auto collapsed = hc_head(residual, hc_head_fn_, hc_head_scale_, hc_head_base_, rms_eps, hc_eps);
     auto normed = norm_->forward(collapsed);
     auto logits = head_->forward(normed)->contiguous();
     auto logits_view = logits->view({size_t{1}, token_ids.size(), logits->size(logits->ndim() - 1)});
+    const double metric_head = metric_lap();
     infinicore::Tensor draft_ids = infinicore::Tensor::empty({size_t{0}}, infinicore::DataType::I64, infinicore::Device::cpu());
     const bool run_dspark = !input.sample_all_positions && dspark_block_size_ > 0 && mtp_.size() >= 3 && target_hidden.size() == dspark_target_layers_.size();
     if (run_dspark) {
@@ -177,6 +195,7 @@ infinilm::InfinilmModel::Output DeepseekV4ForCausalLM::forward(const Input &inpu
         for (const auto &layer : mtp_) {
             layer->cache_draft_context(main_x, positions);
         }
+        const double metric_cache = metric_lap();
         if (token_ids.size() == 1) {
             const size_t vocab = logits->size(logits->ndim() - 1);
             auto row = logits->narrow({{0, token_ids.size() - 1, 1}})->contiguous()->view({vocab});
@@ -199,9 +218,20 @@ infinilm::InfinilmModel::Output DeepseekV4ForCausalLM::forward(const Input &inpu
             for (const auto &layer : mtp_) {
                 block_hidden = layer->forward(block_hidden, block_positions, block_ids);
             }
+            const double metric_draft_layers = metric_lap();
             const auto sampled = mtp_.back()->sample_dspark_block(block_hidden, anchor, dspark_block_size_, *head_);
             draft_ids = infinicore::Tensor::empty({sampled.size()}, infinicore::DataType::I64, infinicore::Device::cpu());
             std::memcpy(draft_ids->data(), sampled.data(), sampled.size() * sizeof(int64_t));
+            const double metric_sample = metric_lap();
+            if (time_decode) {
+                std::fprintf(stderr,
+                             "METRIC_MTP target_layers_ms %.3f head_ms %.3f cache_ms %.3f draft_layers_ms %.3f sample_ms %.3f\n",
+                             metric_layers,
+                             metric_head - metric_layers,
+                             metric_cache - metric_head,
+                             metric_draft_layers - metric_cache,
+                             metric_sample - metric_draft_layers);
+            }
         }
     }
     return {logits_view, draft_ids};

@@ -12,11 +12,16 @@
 #include "infinicore/ops/softmax.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace infinilm::models::deepseek_v4 {
 namespace {
@@ -35,6 +40,45 @@ infinicore::Tensor attend_heads(const infinicore::Tensor &query_heads,
     infinicore::op::softmax_(probs, logits, 1);
     auto kept = cast_dtype(probs->narrow({{1, 0, rows}})->contiguous(), query_heads->dtype());
     return infinicore::op::matmul(kept, keys);
+}
+
+// Timer for metric 1 in generation. The Iluvatar FlashMLA launch already
+// synchronizes its stream before returning, so the wall time of the call is
+// the kernel time and this adds no extra sync. Buckets: prefill (many
+// tokens), decode (one token), spec (DSpark draft/verify blocks).
+struct FlashMlaTimer {
+    bool enabled = std::getenv("INFINI_FLASHMLA_TIMER") != nullptr;
+    double ms[3] = {0.0, 0.0, 0.0};
+    double flops[3] = {0.0, 0.0, 0.0};
+    size_t count[3] = {0, 0, 0};
+    void add(size_t tokens, double call_ms, double call_flops) {
+        const size_t bucket = tokens >= 32 ? 0 : (tokens == 1 ? 1 : 2);
+        ms[bucket] += call_ms;
+        flops[bucket] += call_flops;
+        count[bucket] += 1;
+    }
+    ~FlashMlaTimer() {
+        if (!enabled) {
+            return;
+        }
+        const char *names[3] = {"prefill", "decode", "spec"};
+        for (size_t bucket = 0; bucket < 3; ++bucket) {
+            if (count[bucket] == 0) {
+                continue;
+            }
+            std::fprintf(stderr,
+                         "METRIC_FLASHMLA_GEN %s calls %zu ms %.3f tflops %.3f\n",
+                         names[bucket],
+                         count[bucket],
+                         ms[bucket],
+                         ms[bucket] > 0.0 ? flops[bucket] / ms[bucket] / 1.0e9 : 0.0);
+        }
+    }
+};
+
+FlashMlaTimer &flash_mla_timer() {
+    thread_local FlashMlaTimer timer;
+    return timer;
 }
 
 } // namespace
@@ -323,7 +367,21 @@ infinicore::Tensor DeepseekV4Attention::forward(infinicore::Tensor hidden,
             row_starts[t] = static_cast<int32_t>(starts[t]);
             row_lens[t] = static_cast<int32_t>(lens[t]);
         }
-        infinicore::op::flash_mla_(attn, query, packed, sink, scale_, row_starts, row_lens);
+        auto &timer = flash_mla_timer();
+        if (timer.enabled) {
+            double rows = 0.0;
+            for (const auto len : row_lens) {
+                rows += static_cast<double>(len);
+            }
+            const auto begin = std::chrono::steady_clock::now();
+            infinicore::op::flash_mla_(attn, query, packed, sink, scale_, row_starts, row_lens);
+            const auto end = std::chrono::steady_clock::now();
+            timer.add(tokens,
+                      std::chrono::duration<double, std::milli>(end - begin).count(),
+                      2.0 * static_cast<double>(local_heads_) * static_cast<double>(head_dim_) * rows);
+        } else {
+            infinicore::op::flash_mla_(attn, query, packed, sink, scale_, row_starts, row_lens);
+        }
     } else {
         for (size_t t = 0; t < tokens; ++t) {
             auto q_t = query->narrow({{0, t, 1}})->contiguous()->view({local_heads_, head_dim_});
