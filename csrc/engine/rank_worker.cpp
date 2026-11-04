@@ -2,9 +2,44 @@
 #include "../models/model_factory.hpp"
 #include "infinicore/ops.hpp"
 #include "infinicore/ops/distributed/send_recv.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <dlfcn.h>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
 #include <unordered_map>
+
+namespace {
+
+// cudaProfilerStart only arms the calling context. Each rank thread has its own,
+// so the sample sets IXSYS_PROFILE_ARMED after warmup and every worker starts here.
+void ixsys_arm_profiler() {
+    static thread_local bool started = false;
+    if (started) {
+        return;
+    }
+    const char *armed = std::getenv("IXSYS_PROFILE_ARMED");
+    if (armed == nullptr || armed[0] == '\0' || armed[0] == '0') {
+        return;
+    }
+    void *lib = dlopen("libcudart.so", RTLD_NOW | RTLD_GLOBAL);
+    if (lib == nullptr) {
+        lib = dlopen("libcudart.so.10.2", RTLD_NOW | RTLD_GLOBAL);
+    }
+    if (lib == nullptr) {
+        return;
+    }
+    using StartFn = int (*)();
+    auto start = reinterpret_cast<StartFn>(dlsym(lib, "cudaProfilerStart"));
+    if (start == nullptr || start() != 0) {
+        return;
+    }
+    std::fprintf(stderr, "PROFILER_START_RANK\n");
+    std::fflush(stderr);
+    started = true;
+}
+
+} // namespace
 
 namespace infinilm::engine {
 
@@ -422,6 +457,7 @@ void RankWorker::thread_loop() {
                 cv_.notify_all();
             } else if (local_cmd == Command::RUN) {
                 try {
+                    ixsys_arm_profiler();
                     {
                         std::lock_guard<std::mutex> lk(mutex_);
 

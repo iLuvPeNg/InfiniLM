@@ -61,6 +61,7 @@ class SentencePieceProcessor(BasicLLMProcessor):
 
 
 @register_processor("fm9g")
+@register_processor("fm9g7b")
 class FM9GProcessor(SentencePieceProcessor):
     pass
 

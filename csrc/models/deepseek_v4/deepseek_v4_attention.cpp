@@ -81,6 +81,41 @@ FlashMlaTimer &flash_mla_timer() {
     return timer;
 }
 
+float rope_freq(size_t pair, size_t rope_dim, double theta) {
+    return static_cast<float>(1.0 / std::pow(theta, (2.0 * static_cast<double>(pair)) / static_cast<double>(rope_dim)));
+}
+
+// Compressor layers use the checkpoint YaRN table. Sliding-window layers keep
+// plain RoPE. mscale is disabled, so cos and sin are not rescaled.
+std::vector<float> yarn_inv_freq(size_t rope_dim,
+                                 double theta,
+                                 double factor,
+                                 int beta_fast,
+                                 int beta_slow,
+                                 double original_max) {
+    const size_t half = rope_dim / 2;
+    auto correction = [&](double rotations) {
+        return (static_cast<double>(rope_dim) * std::log(original_max / (rotations * 2.0 * 3.14159265358979323846)))
+               / (2.0 * std::log(theta));
+    };
+    double low = std::floor(correction(static_cast<double>(beta_fast)));
+    double high = std::ceil(correction(static_cast<double>(beta_slow)));
+    low = std::max(low, 0.0);
+    high = std::min(high, static_cast<double>(rope_dim) - 1.0);
+    if (low == high) {
+        high += 0.001;
+    }
+    std::vector<float> inv(half);
+    for (size_t pair = 0; pair < half; ++pair) {
+        const double extra = static_cast<double>(rope_freq(pair, rope_dim, theta));
+        const double interpolated = extra / factor;
+        double ramp = (static_cast<double>(pair) - low) / (high - low);
+        ramp = std::min(1.0, std::max(0.0, ramp));
+        inv[pair] = static_cast<float>(interpolated * ramp + extra * (1.0 - ramp));
+    }
+    return inv;
+}
+
 } // namespace
 
 DeepseekV4Compressor::DeepseekV4Compressor(size_t hidden_size,
@@ -143,6 +178,26 @@ DeepseekV4Attention::DeepseekV4Attention(std::shared_ptr<infinilm::config::Model
     rope_theta_ = model_config->get<double>("rope_theta");
     compress_rope_theta_ = model_config->get<double>("compress_rope_theta");
     scale_ = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    if (compress_ratio > 1) {
+        double factor = 16.0;
+        int beta_fast = 32;
+        int beta_slow = 1;
+        double original_max = 65536.0;
+        const auto &cfg = model_config->get_config_json();
+        if (cfg.contains("rope_scaling") && cfg["rope_scaling"].is_object()) {
+            const auto &scaling = cfg["rope_scaling"];
+            factor = scaling.value("factor", factor);
+            beta_fast = scaling.value("beta_fast", beta_fast);
+            beta_slow = scaling.value("beta_slow", beta_slow);
+            original_max = scaling.value("original_max_position_embeddings", original_max);
+        }
+        rope_inv_freq_ = yarn_inv_freq(rope_dim_, compress_rope_theta_, factor, beta_fast, beta_slow, original_max);
+    } else {
+        rope_inv_freq_.resize(rope_dim_ / 2);
+        for (size_t pair = 0; pair < rope_inv_freq_.size(); ++pair) {
+            rope_inv_freq_[pair] = rope_freq(pair, rope_dim_, rope_theta_);
+        }
+    }
     const auto &rank_info = infinilm::global_state::get_tensor_model_parallel_rank_info();
     if (n_heads % static_cast<size_t>(rank_info.tp_size) != 0 || o_groups % static_cast<size_t>(rank_info.tp_size) != 0) {
         throw std::runtime_error("deepseek_v4 attention: num_attention_heads and o_groups must be divisible by tp size");
@@ -176,8 +231,42 @@ void copy_last_row(infinicore::Tensor dst, size_t dst_row, const infinicore::Ten
     dst->narrow({{0, dst_row, 1}})->view({n})->copy_from(src->narrow({{0, src_row, 1}})->contiguous()->view({n}));
 }
 
-float rope_freq(size_t pair, size_t rope_dim, double theta) {
-    return static_cast<float>(1.0 / std::pow(theta, (2.0 * static_cast<double>(pair)) / static_cast<double>(rope_dim)));
+void copy_rows(infinicore::Tensor dst, size_t dst_row, const infinicore::Tensor &src, size_t src_row, size_t nrows) {
+    if (nrows == 0) {
+        return;
+    }
+    const size_t dim = src->size(src->ndim() - 1);
+    dst->narrow({{0, dst_row, nrows}})->view({nrows, dim})->copy_from(
+        src->narrow({{0, src_row, nrows}})->contiguous()->view({nrows, dim}));
+}
+
+bool contiguous_positions(const std::vector<int64_t> &positions, int64_t *origin) {
+    if (positions.empty()) {
+        return false;
+    }
+    for (size_t i = 0; i < positions.size(); ++i) {
+        if (positions[i] != positions[0] + static_cast<int64_t>(i)) {
+            return false;
+        }
+    }
+    *origin = positions[0];
+    return true;
+}
+
+infinicore::Tensor rope_table(size_t max_pos,
+                              size_t rope_dim,
+                              const std::vector<float> &inv_freq,
+                              const infinicore::Device &device) {
+    const size_t half = rope_dim / 2;
+    std::vector<float> table(max_pos * rope_dim);
+    for (size_t pos = 0; pos < max_pos; ++pos) {
+        for (size_t pair = 0; pair < half; ++pair) {
+            const double ang = static_cast<double>(pos) * static_cast<double>(inv_freq[pair]);
+            table[pos * rope_dim + pair] = static_cast<float>(std::cos(ang));
+            table[pos * rope_dim + half + pair] = static_cast<float>(std::sin(ang));
+        }
+    }
+    return upload_f32(table, {max_pos, rope_dim}, device);
 }
 
 infinicore::Tensor cache_slot(size_t layer_idx, size_t slot) {
@@ -221,21 +310,17 @@ infinicore::Tensor DeepseekV4Attention::forward(infinicore::Tensor hidden,
     q = infinicore::op::rms_norm(q, ones, static_cast<float>(eps_));
     auto kv = kv_norm_->forward(int8_gemm(x, wkv_->weight(), wkv_->weight_scale()))->contiguous();
 
-    if (!rope_cache_ || rope_cache_->size(0) != cache_len) {
-        rope_cache_ = make_rope_cache(cache_len, rope_dim_, rope_theta_, device);
-    }
+    ensure_rope_cache(cache_len, device);
     q = apply_rope(q, positions, rope_cache_, head_dim_ - rope_dim_, rope_dim_, false);
     kv = apply_rope(kv, positions, rope_cache_, head_dim_ - rope_dim_, rope_dim_, false);
 
-    if (compressed_valid_.size() != cache_len) {
-        compressed_valid_.assign(cache_len, 0);
-    }
-    const bool new_sequence = std::find(positions.begin(), positions.end(), 0) != positions.end();
-    if (new_sequence) {
-        std::fill(compressed_valid_.begin(), compressed_valid_.end(), 0);
-    }
-    for (size_t t = 0; t < tokens; ++t) {
-        copy_last_row(swa_cache, static_cast<size_t>(positions[t]), kv, t);
+    int64_t origin = 0;
+    if (contiguous_positions(positions, &origin)) {
+        copy_rows(swa_cache, static_cast<size_t>(origin), kv, 0, tokens);
+    } else {
+        for (size_t t = 0; t < tokens; ++t) {
+            copy_last_row(swa_cache, static_cast<size_t>(positions[t]), kv, t);
+        }
     }
 
     if (compressor_) {
@@ -244,118 +329,166 @@ infinicore::Tensor DeepseekV4Attention::forward(infinicore::Tensor hidden,
         const size_t head = compressor_->head_dim();
         auto state_cache = cache_slot(layer_idx_, kStateCacheSlot);
         auto compressed_cache = cache_slot(layer_idx_, kCompressedCacheSlot);
-        if (!compress_rope_cache_ || compress_rope_cache_->size(0) != cache_len) {
-            compress_rope_cache_ = make_rope_cache(cache_len, rope_dim_, compress_rope_theta_, device);
+        if (compress_ape_.empty()) {
             compress_norm_weight_ = download_f32(compressor_->norm_weight());
+            compress_ape_ = download_f32(compressor_->ape());
         }
         auto projected = compressor_->project(x);
-        auto kv_state = cast_dtype(projected.first, infinicore::DataType::F32);
-        auto score_state = cast_dtype(projected.second, infinicore::DataType::F32);
-        for (size_t t = 0; t < tokens; ++t) {
-            const auto pos = static_cast<size_t>(positions[t]);
-            auto ape = compressor_->ape()->narrow({{0, pos % static_cast<size_t>(ratio), 1}})->contiguous()->view({width});
-            auto score = infinicore::op::add(score_state->narrow({{0, t, 1}})->contiguous()->view({width}), ape);
-            state_cache->narrow({{0, pos, 1}, {1, 0, width}})->view({width})->copy_from(kv_state->narrow({{0, t, 1}})->contiguous()->view({width}));
-            state_cache->narrow({{0, pos, 1}, {1, width, width}})->view({width})->copy_from(score);
+        auto kv_state = cast_dtype(projected.first, infinicore::DataType::F32)->contiguous();
+        auto score_state = cast_dtype(projected.second, infinicore::DataType::F32)->contiguous();
+        if (contiguous_positions(positions, &origin)) {
+            std::vector<float> ape_host(tokens * width);
+            for (size_t t = 0; t < tokens; ++t) {
+                const size_t src = static_cast<size_t>(positions[t] % ratio) * width;
+                std::copy(compress_ape_.begin() + static_cast<std::ptrdiff_t>(src),
+                          compress_ape_.begin() + static_cast<std::ptrdiff_t>(src + width),
+                          ape_host.begin() + static_cast<std::ptrdiff_t>(t * width));
+            }
+            auto ape_rows = upload_f32(ape_host, {tokens, width}, device);
+            auto score = infinicore::op::add(score_state, ape_rows)->contiguous();
+            auto block = infinicore::op::cat({kv_state, score}, 1)->contiguous();
+            const size_t stride = width * 2;
+            state_cache->narrow({{0, static_cast<size_t>(origin), tokens}})->view({tokens, stride})->copy_from(block->view({tokens, stride}));
+        } else {
+            for (size_t t = 0; t < tokens; ++t) {
+                const auto pos = static_cast<size_t>(positions[t]);
+                std::vector<float> ape_host(compress_ape_.begin() + static_cast<std::ptrdiff_t>((pos % static_cast<size_t>(ratio)) * width),
+                                            compress_ape_.begin() + static_cast<std::ptrdiff_t>((pos % static_cast<size_t>(ratio)) * width + width));
+                auto ape = upload_f32(ape_host, {width}, device);
+                auto score = infinicore::op::add(score_state->narrow({{0, t, 1}})->contiguous()->view({width}), ape);
+                state_cache->narrow({{0, pos, 1}, {1, 0, width}})->view({width})->copy_from(kv_state->narrow({{0, t, 1}})->contiguous()->view({width}));
+                state_cache->narrow({{0, pos, 1}, {1, width, width}})->view({width})->copy_from(score);
+            }
         }
         const int overlap = ratio == 4 ? 1 : 0;
         const int n_ctx = (1 + overlap) * ratio;
         const size_t nope = head - rope_dim_;
         const size_t half = rope_dim_ / 2;
-        for (size_t t = 0; t < tokens; ++t) {
-            const int64_t pos = positions[t];
-            if ((pos + 1) % ratio != 0) {
-                continue;
+        std::vector<int64_t> emit;
+        for (int64_t pos : positions) {
+            if ((pos + 1) % ratio == 0) {
+                emit.push_back(pos);
             }
-            const int64_t start = pos - n_ctx + 1;
-            std::vector<float> running_max(head, -std::numeric_limits<float>::infinity());
-            std::vector<float> running_sum(head, 0.0f);
-            std::vector<float> acc(head, 0.0f);
-            for (int step = 0; step < n_ctx; ++step) {
-                const int64_t pos_t = start + step;
-                if (pos_t < 0) {
-                    continue;
+        }
+        if (!emit.empty()) {
+            int64_t slab_lo = emit.front();
+            int64_t slab_hi = emit.front();
+            for (int64_t pos : emit) {
+                slab_lo = std::min(slab_lo, std::max<int64_t>(0, pos - n_ctx + 1));
+                slab_hi = std::max(slab_hi, pos);
+            }
+            const int64_t slab_n = slab_hi - slab_lo + 1;
+            auto slab = download_f32(state_cache->narrow({{0, static_cast<size_t>(slab_lo), static_cast<size_t>(slab_n)}}));
+            const size_t stride = width * 2;
+            std::vector<float> rows(emit.size() * head, 0.0f);
+            for (size_t e = 0; e < emit.size(); ++e) {
+                const int64_t pos = emit[e];
+                const int64_t start = pos - n_ctx + 1;
+                std::vector<float> running_max(head, -std::numeric_limits<float>::infinity());
+                std::vector<float> running_sum(head, 0.0f);
+                std::vector<float> acc(head, 0.0f);
+                for (int step = 0; step < n_ctx; ++step) {
+                    const int64_t pos_t = start + step;
+                    if (pos_t < 0) {
+                        continue;
+                    }
+                    const size_t head_off = step >= ratio ? head : 0;
+                    const float *base = slab.data() + static_cast<size_t>(pos_t - slab_lo) * stride;
+                    const float *kv_part = base + head_off;
+                    const float *score_part = base + width + head_off;
+                    for (size_t d = 0; d < head; ++d) {
+                        const float new_max = std::max(running_max[d], score_part[d]);
+                        const float old_scale = std::exp(running_max[d] - new_max);
+                        const float score_scale = std::exp(score_part[d] - new_max);
+                        acc[d] = acc[d] * old_scale + kv_part[d] * score_scale;
+                        running_sum[d] = running_sum[d] * old_scale + score_scale;
+                        running_max[d] = new_max;
+                    }
                 }
-                const size_t head_off = step >= ratio ? head : 0;
-                auto kv_part = download_f32(state_cache->narrow({{0, static_cast<size_t>(pos_t), 1}, {1, head_off, head}}));
-                auto score_part = download_f32(state_cache->narrow({{0, static_cast<size_t>(pos_t), 1}, {1, width + head_off, head}}));
+                float variance = 0.0f;
                 for (size_t d = 0; d < head; ++d) {
-                    const float new_max = std::max(running_max[d], score_part[d]);
-                    const float old_scale = std::exp(running_max[d] - new_max);
-                    const float score_scale = std::exp(score_part[d] - new_max);
-                    acc[d] = acc[d] * old_scale + kv_part[d] * score_scale;
-                    running_sum[d] = running_sum[d] * old_scale + score_scale;
-                    running_max[d] = new_max;
+                    acc[d] = running_sum[d] == 0.0f ? 0.0f : acc[d] / running_sum[d];
+                    variance += acc[d] * acc[d];
+                }
+                const float rrms = 1.0f / std::sqrt(variance / static_cast<float>(head) + static_cast<float>(eps_));
+                for (size_t d = 0; d < head; ++d) {
+                    acc[d] *= rrms * compress_norm_weight_[d];
+                }
+                const int64_t compressed_pos = (pos / ratio) * ratio;
+                for (size_t pair = 0; pair < half; ++pair) {
+                    const float ang = static_cast<float>(compressed_pos) * rope_inv_freq_[pair];
+                    const float cos_v = std::cos(ang);
+                    const float sin_v = std::sin(ang);
+                    const size_t even = nope + pair * 2;
+                    const float x0 = acc[even];
+                    const float x1 = acc[even + 1];
+                    acc[even] = x0 * cos_v - x1 * sin_v;
+                    acc[even + 1] = x0 * sin_v + x1 * cos_v;
+                }
+                std::copy(acc.begin(), acc.end(), rows.begin() + static_cast<std::ptrdiff_t>(e * head));
+            }
+            auto gpu_rows = cast_dtype(upload_f32(rows, {emit.size(), head}, device), dtype);
+            const int64_t first_slot = emit.front() / ratio;
+            bool dense_slots = true;
+            for (size_t e = 0; e < emit.size(); ++e) {
+                if (emit[e] / ratio != first_slot + static_cast<int64_t>(e)) {
+                    dense_slots = false;
+                    break;
                 }
             }
-            float variance = 0.0f;
-            for (size_t d = 0; d < head; ++d) {
-                acc[d] = running_sum[d] == 0.0f ? 0.0f : acc[d] / running_sum[d];
-                variance += acc[d] * acc[d];
+            if (dense_slots) {
+                copy_rows(compressed_cache, static_cast<size_t>(first_slot), gpu_rows, 0, emit.size());
+            } else {
+                for (size_t e = 0; e < emit.size(); ++e) {
+                    copy_last_row(compressed_cache, static_cast<size_t>(emit[e] / ratio), gpu_rows, e);
+                }
             }
-            const float rrms = 1.0f / std::sqrt(variance / static_cast<float>(head) + static_cast<float>(eps_));
-            for (size_t d = 0; d < head; ++d) {
-                acc[d] *= rrms * compress_norm_weight_[d];
-            }
-            const int64_t compressed_pos = (pos / ratio) * ratio;
-            for (size_t pair = 0; pair < half; ++pair) {
-                const float ang = static_cast<float>(compressed_pos) * rope_freq(pair, rope_dim_, compress_rope_theta_);
-                const float cos_v = std::cos(ang);
-                const float sin_v = std::sin(ang);
-                const size_t even = nope + pair * 2;
-                const float x0 = acc[even];
-                const float x1 = acc[even + 1];
-                acc[even] = x0 * cos_v - x1 * sin_v;
-                acc[even + 1] = x0 * sin_v + x1 * cos_v;
-            }
-            auto row = cast_dtype(upload_f32(acc, {head}, device), dtype);
-            compressed_cache->narrow({{0, static_cast<size_t>(pos), 1}})->view({head})->copy_from(row);
-            compressed_valid_[static_cast<size_t>(pos)] = 1;
         }
     }
 
-    std::vector<std::vector<std::pair<int, size_t>>> keys(tokens);
+    const int ratio = compressor_ ? compressor_->compress_ratio() : 1;
     size_t packed_rows = 0;
-    size_t max_k = 0;
+    std::vector<size_t> swa_at(tokens, 0);
+    std::vector<size_t> swa_n(tokens, 0);
+    std::vector<size_t> cmp_at(tokens, 0);
+    std::vector<size_t> cmp_n(tokens, 0);
     for (size_t t = 0; t < tokens; ++t) {
         const int64_t pos = positions[t];
         const int64_t begin = std::max<int64_t>(0, pos - sliding_window_ + 1);
-        for (int64_t p = begin; p <= pos; ++p) {
-            keys[t].push_back({0, static_cast<size_t>(p)});
-        }
+        swa_at[t] = static_cast<size_t>(begin);
+        swa_n[t] = static_cast<size_t>(pos - begin + 1);
+        packed_rows += swa_n[t];
         if (compressor_) {
-            std::vector<size_t> compressed;
-            for (int64_t p = 0; p <= pos; ++p) {
-                if (compressed_valid_[static_cast<size_t>(p)] != 0) {
-                    compressed.push_back(static_cast<size_t>(p));
-                }
+            int64_t count = (pos + 1) / ratio;
+            int64_t keep = count;
+            if (index_topk_ > 0 && keep > index_topk_) {
+                keep = index_topk_;
             }
-            if (index_topk_ > 0 && static_cast<int>(compressed.size()) > index_topk_) {
-                compressed.erase(compressed.begin(), compressed.end() - index_topk_);
-            }
-            for (size_t p : compressed) {
-                keys[t].push_back({1, p});
-            }
+            cmp_at[t] = static_cast<size_t>(count - keep);
+            cmp_n[t] = static_cast<size_t>(keep);
+            packed_rows += cmp_n[t];
         }
-        packed_rows += keys[t].size();
-        max_k = std::max(max_k, keys[t].size());
     }
-    if (packed_rows == 0 || max_k == 0) {
+    if (packed_rows == 0) {
         throw std::runtime_error("deepseek_v4 attention: no keys for FlashMLA");
     }
     auto packed = infinicore::Tensor::empty({packed_rows, head_dim_}, dtype, device);
     std::vector<size_t> starts(tokens, 0);
     std::vector<size_t> lens(tokens, 0);
     size_t cursor = 0;
+    infinicore::Tensor compressed_cache;
+    if (compressor_) {
+        compressed_cache = cache_slot(layer_idx_, kCompressedCacheSlot);
+    }
     for (size_t t = 0; t < tokens; ++t) {
         starts[t] = cursor;
-        lens[t] = keys[t].size();
-        for (size_t k = 0; k < keys[t].size(); ++k) {
-            const auto &key = keys[t][k];
-            const auto cache = key.first == 0 ? swa_cache : cache_slot(layer_idx_, kCompressedCacheSlot);
-            copy_last_row(packed, cursor, cache, key.second);
-            ++cursor;
+        copy_rows(packed, cursor, swa_cache, swa_at[t], swa_n[t]);
+        cursor += swa_n[t];
+        if (cmp_n[t] > 0) {
+            copy_rows(packed, cursor, compressed_cache, cmp_at[t], cmp_n[t]);
+            cursor += cmp_n[t];
         }
+        lens[t] = cursor - starts[t];
     }
     auto query = q->contiguous();
     auto sink = attn_sink_->contiguous();
@@ -427,13 +560,23 @@ void DeepseekV4Attention::cache_context_kv(infinicore::Tensor hidden,
     }
     const auto device = x->device();
     auto kv = kv_norm_->forward(int8_gemm(x, wkv_->weight(), wkv_->weight_scale()))->contiguous();
-    if (!rope_cache_ || rope_cache_->size(0) != cache_len) {
-        rope_cache_ = make_rope_cache(cache_len, rope_dim_, rope_theta_, device);
-    }
+    ensure_rope_cache(cache_len, device);
     kv = apply_rope(kv, positions, rope_cache_, head_dim_ - rope_dim_, rope_dim_, false);
-    for (size_t t = 0; t < tokens; ++t) {
-        copy_last_row(swa_cache, static_cast<size_t>(positions[t]), kv, t);
+    int64_t origin = 0;
+    if (contiguous_positions(positions, &origin)) {
+        copy_rows(swa_cache, static_cast<size_t>(origin), kv, 0, tokens);
+    } else {
+        for (size_t t = 0; t < tokens; ++t) {
+            copy_last_row(swa_cache, static_cast<size_t>(positions[t]), kv, t);
+        }
     }
+}
+
+void DeepseekV4Attention::ensure_rope_cache(size_t cache_len, const infinicore::Device &device) const {
+    if (rope_cache_ && rope_cache_->size(0) == cache_len) {
+        return;
+    }
+    rope_cache_ = rope_table(cache_len, rope_dim_, rope_inv_freq_, device);
 }
 
 } // namespace infinilm::models::deepseek_v4

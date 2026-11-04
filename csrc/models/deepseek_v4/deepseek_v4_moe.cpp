@@ -5,18 +5,178 @@
 
 #include "infinicore/ops/add.hpp"
 #include "infinicore/ops/distributed/allreduce.hpp"
-#include "infinicore/ops/mul_scalar.hpp"
+#include "infinicore/ops/embedding.hpp"
 #include "infinicore/ops/per_channel_quant_i8.hpp"
 #include "infinicore/ops/w4a8_group_gemm.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <dlfcn.h>
+#include <infinirt.h>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace infinilm::models::deepseek_v4 {
+namespace {
+
+struct RouteNvtx {
+    using PushFn = int (*)(const char *);
+    using PopFn = int (*)();
+    PushFn push_fn = nullptr;
+    PopFn pop_fn = nullptr;
+    bool enabled = false;
+    RouteNvtx() {
+        if (std::getenv("INFINI_NVTX") == nullptr) {
+            return;
+        }
+        void *lib = dlopen("/usr/local/corex/lib64/libnvToolsExt.so", RTLD_LAZY);
+        if (lib == nullptr) {
+            return;
+        }
+        push_fn = reinterpret_cast<PushFn>(dlsym(lib, "nvtxRangePushA"));
+        pop_fn = reinterpret_cast<PopFn>(dlsym(lib, "nvtxRangePop"));
+        enabled = push_fn != nullptr && pop_fn != nullptr;
+    }
+    void on(const char *name) const {
+        if (enabled) {
+            push_fn(name);
+        }
+    }
+    void off() const {
+        if (enabled) {
+            pop_fn();
+        }
+    }
+};
+
+const RouteNvtx &route_nvtx() {
+    static RouteNvtx nvtx;
+    return nvtx;
+}
+
+struct RouteRange {
+    const RouteNvtx &nv;
+    explicit RouteRange(const char *name) : nv(route_nvtx()) { nv.on(name); }
+    ~RouteRange() { nv.off(); }
+};
+
+struct MoeGenTimer {
+    bool enabled = std::getenv("INFINI_MODEL_TIMER") != nullptr;
+    bool dev_ok = false;
+    infiniDevice_t dev_kind{};
+    int dev_id = 0;
+    void capture_device() {
+        if (!dev_ok) {
+            dev_ok = infinirtGetDevice(&dev_kind, &dev_id) == INFINI_STATUS_SUCCESS;
+        }
+    }
+    struct Pair {
+        infinirtEvent_t a = nullptr;
+        infinirtEvent_t b = nullptr;
+    };
+    struct Entry {
+        int bucket = 0; // 0: prefill, 1: decode, 2: spec
+        size_t rows = 0;
+        size_t max_expert = 0;
+        Pair gather;
+        Pair q1;
+        Pair g13;
+        Pair q2;
+        Pair g2;
+        Pair scatter;
+    };
+    std::vector<Entry> entries;
+    static Pair make_pair() {
+        Pair p;
+        infinirtEventCreate(&p.a);
+        infinirtEventCreate(&p.b);
+        return p;
+    }
+    static float elapsed(const Pair &p) {
+        float ms = 0.0f;
+        infinirtEventSynchronize(p.b);
+        infinirtEventElapsedTime(&ms, p.a, p.b);
+        infinirtEventDestroy(p.a);
+        infinirtEventDestroy(p.b);
+        return ms;
+    }
+    ~MoeGenTimer() {
+        if (!enabled || entries.empty()) {
+            return;
+        }
+        if (dev_ok) {
+            infinirtSetDevice(dev_kind, dev_id);
+        }
+        const char *bnames[3] = {"prefill", "decode", "spec"};
+        double route_ms[3] = {0, 0, 0};
+        double quant_ms[3] = {0, 0, 0};
+        double gemm_ms[3] = {0, 0, 0};
+        double gemm_flops[3] = {0, 0, 0};
+        size_t calls[3] = {0, 0, 0};
+        size_t total_rows[3] = {0, 0, 0};
+        double dist_ms[3] = {0, 0, 0};
+        size_t dist_n[3] = {0, 0, 0};
+        for (const auto &e : entries) {
+            const float ga = elapsed(e.gather);
+            const float sc = elapsed(e.scatter);
+            const float qa = elapsed(e.q1) + elapsed(e.q2);
+            const float gm = elapsed(e.g13) + elapsed(e.g2);
+            const int b = e.bucket;
+            route_ms[b] += ga + sc;
+            quant_ms[b] += qa;
+            gemm_ms[b] += gm;
+            // 3 GEMMs per MoE layer: w1, w3 (rows x 2048 x 4096) and w2 (rows x 4096 x 2048)
+            gemm_flops[b] += 3.0 * 2.0 * static_cast<double>(e.rows) * 2048.0 * 4096.0;
+            calls[b] += 1;
+            total_rows[b] += e.rows;
+            if (b == 0 && e.rows > 0) {
+                const double ratio = static_cast<double>(e.max_expert) / static_cast<double>(e.rows);
+                const int d = ratio >= 0.5 ? 2 : (ratio >= 0.12 ? 1 : 0);
+                dist_ms[d] += ga + sc;
+                dist_n[d] += 1;
+            }
+        }
+        for (int b = 0; b < 3; ++b) {
+            if (calls[b] == 0) {
+                continue;
+            }
+            const double tot = quant_ms[b] + gemm_ms[b];
+            std::fprintf(stderr,
+                         "METRIC_MOE_GEN %s calls %zu rows %zu route_ms %.3f route_avg_ms %.3f quant_ms %.3f gemm_ms %.3f gemm_tflops %.4f quant_share %.4f\n",
+                         bnames[b],
+                         calls[b],
+                         total_rows[b],
+                         route_ms[b],
+                         route_ms[b] / static_cast<double>(calls[b]),
+                         quant_ms[b],
+                         gemm_ms[b],
+                         gemm_ms[b] > 0.0 ? gemm_flops[b] / gemm_ms[b] / 1.0e9 : 0.0,
+                         tot > 0.0 ? quant_ms[b] / tot : 0.0);
+        }
+        const char *dnames[3] = {"uniform", "skewed", "extreme_sparse"};
+        for (int d = 0; d < 3; ++d) {
+            if (dist_n[d] > 0) {
+                std::fprintf(stderr,
+                             "METRIC_MOE_DIST %s layers %zu avg_ms %.3f\n",
+                             dnames[d],
+                             dist_n[d],
+                             dist_ms[d] / static_cast<double>(dist_n[d]));
+            }
+        }
+    }
+};
+
+MoeGenTimer &moe_gen_timer() {
+    thread_local MoeGenTimer timer;
+    return timer;
+}
+
+} // namespace
 
 DeepseekV4Gate::DeepseekV4Gate(std::shared_ptr<infinilm::config::ModelConfig> model_config,
                                const infinicore::Device &device,
@@ -227,36 +387,96 @@ infinicore::Tensor DeepseekV4MoE::forward(infinicore::Tensor hidden, const std::
     auto acc = infinicore::Tensor::zeros({tokens, hidden_}, dtype, device);
     const size_t rows = routes.size();
     if (rows > 0) {
+        auto &mt = moe_gen_timer();
+        infinirtStream_t stream = mt.enabled ? infinicore::context::getStream() : nullptr;
+        MoeGenTimer::Entry entry{};
+        if (mt.enabled) {
+            mt.capture_device();
+            entry.bucket = tokens >= 32 ? 0 : (tokens == 1 ? 1 : 2);
+            entry.rows = rows;
+            entry.gather = MoeGenTimer::make_pair();
+            entry.q1 = MoeGenTimer::make_pair();
+            entry.g13 = MoeGenTimer::make_pair();
+            entry.q2 = MoeGenTimer::make_pair();
+            entry.g2 = MoeGenTimer::make_pair();
+            entry.scatter = MoeGenTimer::make_pair();
+            infinirtEventRecord(entry.gather.a, stream);
+        }
         const size_t local_experts = w1_packed_->size(0);
         std::vector<int32_t> counts(local_experts, 0);
-        auto packed_act = infinicore::Tensor::empty({rows, hidden_}, dtype, device);
+        std::vector<int32_t> token_indices(rows);
+        std::vector<float> route_weights(rows);
         for (size_t i = 0; i < rows; ++i) {
             if (routes[i].local >= local_experts) {
                 throw std::runtime_error("deepseek_v4 moe: local expert index out of range");
             }
             counts[routes[i].local] += 1;
-            packed_act->narrow({{0, i, 1}})->view({hidden_})->copy_from(x->narrow({{0, routes[i].token, 1}})->contiguous()->view({hidden_}));
+            token_indices[i] = static_cast<int32_t>(routes[i].token);
+            route_weights[i] = routes[i].weight;
+        }
+        auto route_index = upload_i32(token_indices, {rows}, device);
+        infinicore::Tensor packed_act;
+        {
+            RouteRange gather_range("moe_route_gather");
+            packed_act = infinicore::op::embedding(route_index, x);
+        }
+        if (mt.enabled) {
+            infinirtEventRecord(entry.gather.b, stream);
+            for (int32_t c : counts) {
+                entry.max_expert = std::max(entry.max_expert, static_cast<size_t>(c));
+            }
         }
         auto tokens_per_experts = upload_i32(counts, {local_experts}, infinicore::Device::cpu());
         auto act_i8 = infinicore::Tensor::empty({rows, hidden_}, infinicore::DataType::I8, device);
         auto act_scale = infinicore::Tensor::empty({rows, size_t{1}}, infinicore::DataType::F32, device);
+        if (mt.enabled) {
+            infinirtEventRecord(entry.q1.a, stream);
+        }
         infinicore::op::per_channel_quant_i8_(packed_act, act_i8, act_scale);
+        if (mt.enabled) {
+            infinirtEventRecord(entry.q1.b, stream);
+        }
         auto gate = infinicore::Tensor::empty({rows, intermediate_}, dtype, device);
         auto up = infinicore::Tensor::empty({rows, intermediate_}, dtype, device);
+        if (mt.enabled) {
+            infinirtEventRecord(entry.g13.a, stream);
+        }
         infinicore::op::w4a8_group_gemm_(gate, act_i8, w1_packed_->contiguous(), act_scale, w1_scale_packed_->contiguous(), tokens_per_experts);
         infinicore::op::w4a8_group_gemm_(up, act_i8, w3_packed_->contiguous(), act_scale, w3_scale_packed_->contiguous(), tokens_per_experts);
+        if (mt.enabled) {
+            infinirtEventRecord(entry.g13.b, stream);
+        }
         auto mid = swiglu_clamp(gate, up, swiglu_limit_);
         auto mid_i8 = infinicore::Tensor::empty({rows, intermediate_}, infinicore::DataType::I8, device);
         auto mid_scale = infinicore::Tensor::empty({rows, size_t{1}}, infinicore::DataType::F32, device);
+        if (mt.enabled) {
+            infinirtEventRecord(entry.q2.a, stream);
+        }
         infinicore::op::per_channel_quant_i8_(mid, mid_i8, mid_scale);
+        if (mt.enabled) {
+            infinirtEventRecord(entry.q2.b, stream);
+        }
         auto down = infinicore::Tensor::empty({rows, hidden_}, dtype, device);
+        if (mt.enabled) {
+            infinirtEventRecord(entry.g2.a, stream);
+        }
         infinicore::op::w4a8_group_gemm_(down, mid_i8, w2_packed_->contiguous(), mid_scale, w2_scale_packed_->contiguous(), tokens_per_experts);
+        if (mt.enabled) {
+            infinirtEventRecord(entry.g2.b, stream);
+            infinirtEventRecord(entry.scatter.a, stream);
+        }
+        std::vector<float> route_mix(tokens * rows, 0.0f);
         for (size_t i = 0; i < rows; ++i) {
-            auto row = down->narrow({{0, i, 1}})->contiguous()->view({hidden_});
-            auto scaled = infinicore::op::mul_scalar(row, static_cast<double>(routes[i].weight));
-            const size_t token = routes[i].token;
-            auto dst = acc->narrow({{0, token, 1}})->contiguous()->view({hidden_});
-            acc->narrow({{0, token, 1}})->view({hidden_})->copy_from(infinicore::op::add(dst, scaled));
+            route_mix[routes[i].token * rows + i] = route_weights[i];
+        }
+        auto route_matrix = cast_dtype(upload_f32(route_mix, {tokens, rows}, device), dtype);
+        {
+            RouteRange scatter_range("moe_route_scatter");
+            acc = infinicore::op::matmul(route_matrix, down);
+        }
+        if (mt.enabled) {
+            infinirtEventRecord(entry.scatter.b, stream);
+            mt.entries.push_back(entry);
         }
     }
     if (tp_size_ > 1 && comm_ != nullptr) {

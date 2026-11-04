@@ -23,9 +23,30 @@ namespace infinilm::models::deepseek_v4 {
 namespace {
 
 constexpr float kHcPostAlpha = 2.0f;
+constexpr size_t kHostRetainLimit = 32;
 
 void sync_device() {
     infinicore::context::syncDevice();
+}
+
+// Async H2D reads the CPU tensor after this function returns. Keep those
+// tensors until a later sync, and flush a whole batch instead of stalling
+// the device on every upload.
+void retain_host(infinicore::Tensor cpu) {
+    struct Retainer {
+        std::vector<infinicore::Tensor> kept;
+        ~Retainer() {
+            if (!kept.empty()) {
+                infinicore::context::syncDevice();
+            }
+        }
+    };
+    thread_local Retainer retainer;
+    retainer.kept.push_back(std::move(cpu));
+    if (retainer.kept.size() >= kHostRetainLimit) {
+        sync_device();
+        retainer.kept.clear();
+    }
 }
 
 float sigmoid_cpu(float x) {
@@ -107,7 +128,6 @@ infinicore::Tensor cast_dtype(const infinicore::Tensor &x, infinicore::DataType 
 std::vector<float> download_f32(const infinicore::Tensor &x) {
     sync_device();
     auto cpu = cast_dtype(x, infinicore::DataType::F32)->to(infinicore::Device::cpu())->contiguous();
-    sync_device();
     const auto *ptr = reinterpret_cast<const float *>(cpu->data());
     return std::vector<float>(ptr, ptr + cpu->numel());
 }
@@ -143,8 +163,11 @@ infinicore::Tensor upload_f32(const std::vector<float> &data,
     }
     auto cpu = infinicore::Tensor::empty(shape, infinicore::DataType::F32, infinicore::Device::cpu());
     std::memcpy(cpu->data(), data.data(), n * sizeof(float));
+    if (device.getType() == infinicore::Device::Type::CPU) {
+        return cpu;
+    }
     auto gpu = cpu->to(device);
-    sync_device();
+    retain_host(cpu);
     return gpu;
 }
 
@@ -164,7 +187,7 @@ infinicore::Tensor upload_i32(const std::vector<int32_t> &data,
         return cpu;
     }
     auto gpu = cpu->to(device);
-    sync_device();
+    retain_host(cpu);
     return gpu;
 }
 
@@ -218,7 +241,7 @@ infinicore::Tensor apply_rope(const infinicore::Tensor &x,
     auto pos = infinicore::Tensor::empty({rows}, infinicore::DataType::I64, infinicore::Device::cpu());
     std::memcpy(pos->data(), repeated.data(), rows * sizeof(int64_t));
     auto pos_dev = pos->to(x->device());
-    sync_device();
+    retain_host(pos);
     auto cs = infinicore::op::embedding(pos_dev, cos_sin);
     auto cos = cs->narrow({{1, 0, half}})->contiguous();
     auto sin = cs->narrow({{1, half, half}})->contiguous();
@@ -317,12 +340,10 @@ MhcOut mhc_pre(const infinicore::Tensor &residual,
             residual_out->narrow({{1, c, 1}})->view({tokens, hidden})->copy_from(src);
         }
     }
+    auto pre_all = upload_f32(pre_cpu, {tokens, hc}, device);
     auto layer_input = infinicore::Tensor::empty({tokens, hidden}, dtype, device);
     for (size_t t = 0; t < tokens; ++t) {
-        auto pre = upload_f32(std::vector<float>(pre_cpu.begin() + static_cast<std::ptrdiff_t>(t * hc),
-                                                 pre_cpu.begin() + static_cast<std::ptrdiff_t>((t + 1) * hc)),
-                              {1, hc},
-                              device);
+        auto pre = pre_all->narrow({{0, t, 1}})->contiguous()->view({1, hc});
         auto res_t = cast_dtype(residual_out->narrow({{0, t, 1}})->contiguous()->view({hc, hidden}), infinicore::DataType::F32);
         auto mixed = infinicore::op::matmul(pre, res_t);
         layer_input->narrow({{0, t, 1}})->view({hidden})->copy_from(cast_dtype(mixed->view({hidden}), dtype));
@@ -393,9 +414,10 @@ infinicore::Tensor hc_head(const infinicore::Tensor &residual,
             pre_cpu[t * hc + c] = sigmoid_cpu(scale0 * mix_cpu[t * hc + c] * rms + base_cpu[c]) + eps;
         }
     }
+    auto pre_all = upload_f32(pre_cpu, {tokens, hc}, device);
     auto out = infinicore::Tensor::empty({tokens, hidden}, dtype, device);
     for (size_t t = 0; t < tokens; ++t) {
-        auto pre = f32_row(pre_cpu, t * hc, hc, device);
+        auto pre = pre_all->narrow({{0, t, 1}})->contiguous()->view({1, hc});
         auto res_t = cast_dtype(residual->narrow({{0, t, 1}})->contiguous()->view({hc, hidden}), infinicore::DataType::F32);
         auto mixed = infinicore::op::matmul(pre, res_t);
         out->narrow({{0, t, 1}})->view({hidden})->copy_from(cast_dtype(mixed->view({hidden}), dtype));

@@ -21,6 +21,27 @@ from infinilm.processors import AutoInfinilmProcessor
 
 logger = logging.getLogger(__name__)
 
+# Optional NVTX ranges for ixsys (`-t cuda,nvtx`), enabled by INFINI_NVTX.
+# Disabled by default; when disabled the helpers below are no-ops.
+_nvtx_lib = None
+if os.environ.get("INFINI_NVTX"):
+    try:
+        import ctypes
+
+        _nvtx_lib = ctypes.CDLL("/usr/local/corex/lib64/libnvToolsExt.so")
+    except OSError:
+        _nvtx_lib = None
+
+
+def _nvtx_range_push(name: str) -> None:
+    if _nvtx_lib is not None:
+        _nvtx_lib.nvtxRangePushA(name.encode())
+
+
+def _nvtx_range_pop() -> None:
+    if _nvtx_lib is not None:
+        _nvtx_lib.nvtxRangePop()
+
 
 @dataclass
 class KVConnectorOutput:
@@ -264,7 +285,13 @@ class ModelRunner:
         # forward_raw defaults sample_all_positions to True, which skips DSpark.
         metric_timer = os.environ.get("INFINI_METRIC_TIMER")
         metric_start = time.perf_counter() if metric_timer else 0.0
-        raw = self.model_engine.forward_raw(**model_input, sample_all_positions=False)
+        _nvtx_range_push("dspark_target_plus_draft")
+        try:
+            raw = self.model_engine.forward_raw(
+                **model_input, sample_all_positions=False
+            )
+        finally:
+            _nvtx_range_pop()
         if metric_timer:
             print(
                 f"METRIC_MTP target_plus_draft_ms {(time.perf_counter() - metric_start) * 1000.0:.3f}",
@@ -281,6 +308,7 @@ class ModelRunner:
         req = scheduler_output.scheduled_requests[0]
         base_len = req.get_total_length()
         verify_start = time.perf_counter() if metric_timer else 0.0
+        _nvtx_range_push("dspark_verify")
         verify = self.model_engine.forward_raw(
             input_ids=infinicore.from_list([draft], dtype=infinicore.int64),
             position_ids=infinicore.from_list(
@@ -300,6 +328,7 @@ class ModelRunner:
             top_k=1,
             top_p=1.0,
         )
+        _nvtx_range_pop()
         if metric_timer:
             print(
                 f"METRIC_MTP verify_ms {(time.perf_counter() - verify_start) * 1000.0:.3f}",

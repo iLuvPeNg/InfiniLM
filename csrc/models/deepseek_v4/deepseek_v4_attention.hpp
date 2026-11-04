@@ -64,6 +64,7 @@ public:
     void cache_context_kv(infinicore::Tensor hidden, const std::vector<int64_t> &positions) const;
 
 private:
+    void ensure_rope_cache(size_t cache_len, const infinicore::Device &device) const;
     size_t layer_idx_{0};
     size_t local_heads_{0};
     size_t head_dim_{0};
@@ -77,10 +78,11 @@ private:
     double rope_theta_{10000.0};
     double compress_rope_theta_{160000.0};
     float scale_{1.0f};
+    std::vector<float> rope_inv_freq_;
     mutable infinicore::Tensor rope_cache_;
-    mutable infinicore::Tensor compress_rope_cache_;
     mutable std::vector<uint8_t> compressed_valid_;
     mutable std::vector<float> compress_norm_weight_;
+    mutable std::vector<float> compress_ape_;
     INFINICORE_NN_PARAMETER(attn_sink);
     INFINICORE_NN_MODULE(infinicore::nn::RMSNorm, q_norm);
     INFINICORE_NN_MODULE(infinicore::nn::RMSNorm, kv_norm);

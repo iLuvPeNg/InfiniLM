@@ -20,6 +20,9 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <infinirt.h>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -30,6 +33,56 @@ namespace {
 
 constexpr size_t kNsaBlockSize = 64;
 constexpr int kNsaSelectBlocks = 4;
+
+struct NsaGenTimer {
+    bool enabled = std::getenv("INFINI_MODEL_TIMER") != nullptr;
+    bool dev_ok = false;
+    infiniDevice_t dev_kind{};
+    int dev_id = 0;
+    void capture_device() {
+        if (!dev_ok) {
+            dev_ok = infinirtGetDevice(&dev_kind, &dev_id) == INFINI_STATUS_SUCCESS;
+        }
+    }
+    struct Entry {
+        infinirtEvent_t c0 = nullptr, c1 = nullptr, a0 = nullptr, a1 = nullptr;
+    };
+    std::vector<Entry> entries;
+    ~NsaGenTimer() {
+        if (!enabled || entries.empty()) {
+            return;
+        }
+        if (dev_ok) {
+            infinirtSetDevice(dev_kind, dev_id);
+        }
+        double comp_ms = 0.0, attn_ms = 0.0;
+        for (const auto &e : entries) {
+            float cm = 0.0f, am = 0.0f;
+            infinirtEventSynchronize(e.a1);
+            infinirtEventElapsedTime(&cm, e.c0, e.c1);
+            infinirtEventElapsedTime(&am, e.a0, e.a1);
+            infinirtEventDestroy(e.c0);
+            infinirtEventDestroy(e.c1);
+            infinirtEventDestroy(e.a0);
+            infinirtEventDestroy(e.a1);
+            comp_ms += cm;
+            attn_ms += am;
+        }
+        const double n = static_cast<double>(entries.size());
+        std::fprintf(stderr,
+                     "METRIC_NSA_GEN calls %zu compress_total_ms %.3f compress_avg_ms %.3f attn_total_ms %.3f attn_avg_ms %.3f\n",
+                     entries.size(),
+                     comp_ms,
+                     comp_ms / n,
+                     attn_ms,
+                     attn_ms / n);
+    }
+};
+
+NsaGenTimer &nsa_gen_timer() {
+    thread_local NsaGenTimer timer;
+    return timer;
+}
 
 infinicore::Tensor scalar_tensor(float value, const infinicore::Device &device) {
     auto cpu = infinicore::Tensor::from_blob(&value, {1}, infinicore::DataType::F32, infinicore::Device::cpu());
@@ -403,6 +456,17 @@ infinicore::Tensor VideoNSAAttention::forward(const infinicore::Tensor &position
             nsa_cmp_cache_ready_ = false;
         }
         const bool update_last_only = nsa_cmp_cache_ready_;
+        auto &nt = nsa_gen_timer();
+        NsaGenTimer::Entry nentry{};
+        infinirtStream_t nstream = nt.enabled ? infinicore::context::getStream() : nullptr;
+        if (nt.enabled) {
+            nt.capture_device();
+            infinirtEventCreate(&nentry.c0);
+            infinirtEventCreate(&nentry.c1);
+            infinirtEventCreate(&nentry.a0);
+            infinirtEventCreate(&nentry.a1);
+            infinirtEventRecord(nentry.c0, nstream);
+        }
         infinicore::op::nsa_compress_paged_cache_(
             nsa_k_cmp_cache_.value(),
             nsa_v_cmp_cache_.value(),
@@ -412,9 +476,15 @@ infinicore::Tensor VideoNSAAttention::forward(const infinicore::Tensor &position
             attn_metadata.total_sequence_lengths.value(),
             static_cast<int>(kNsaBlockSize),
             update_last_only);
+        if (nt.enabled) {
+            infinirtEventRecord(nentry.c1, nstream);
+        }
         nsa_cmp_cache_ready_ = true;
 
         auto nsa_heads = infinicore::Tensor::empty({seq_len, num_attention_heads_, head_dim_}, q_reshaped->dtype(), q_reshaped->device());
+        if (nt.enabled) {
+            infinirtEventRecord(nentry.a0, nstream);
+        }
         infinicore::op::nsa_paged_attention_(
             nsa_heads,
             q_reshaped,
@@ -429,6 +499,10 @@ infinicore::Tensor VideoNSAAttention::forward(const infinicore::Tensor &position
             static_cast<int>(kNsaBlockSize),
             256,
             kNsaSelectBlocks);
+        if (nt.enabled) {
+            infinirtEventRecord(nentry.a1, nstream);
+            nt.entries.push_back(nentry);
+        }
         auto attn_output = nsa_heads->view({1, seq_len, num_attention_heads_ * head_dim_});
         return o_proj_->forward(attn_output);
     }

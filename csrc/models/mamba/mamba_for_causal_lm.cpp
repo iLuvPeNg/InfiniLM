@@ -1,8 +1,73 @@
 #include "mamba_for_causal_lm.hpp"
 #include "../models_registry.hpp"
+#include "infinicore/context/context.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <infinirt.h>
 #include <stdexcept>
+#include <vector>
 
 namespace infinilm::models::mamba {
+namespace {
+
+struct MambaGenTimer {
+    bool enabled = std::getenv("INFINI_MODEL_TIMER") != nullptr;
+    bool dev_ok = false;
+    infiniDevice_t dev_kind{};
+    int dev_id = 0;
+    void capture_device() {
+        if (!dev_ok) {
+            dev_ok = infinirtGetDevice(&dev_kind, &dev_id) == INFINI_STATUS_SUCCESS;
+        }
+    }
+    struct Entry {
+        int bucket = 0; // 0: prefill, 1: decode
+        size_t seq = 0;
+        infinirtEvent_t a = nullptr, b = nullptr;
+    };
+    std::vector<Entry> entries;
+    ~MambaGenTimer() {
+        if (!enabled || entries.empty()) {
+            return;
+        }
+        if (dev_ok) {
+            infinirtSetDevice(dev_kind, dev_id);
+        }
+        const char *names[2] = {"prefill", "decode"};
+        double ms[2] = {0, 0};
+        size_t calls[2] = {0, 0};
+        size_t last_seq[2] = {0, 0};
+        for (const auto &e : entries) {
+            float m = 0.0f;
+            infinirtEventSynchronize(e.b);
+            infinirtEventElapsedTime(&m, e.a, e.b);
+            infinirtEventDestroy(e.a);
+            infinirtEventDestroy(e.b);
+            ms[e.bucket] += m;
+            calls[e.bucket] += 1;
+            last_seq[e.bucket] = e.seq;
+        }
+        for (int b = 0; b < 2; ++b) {
+            if (calls[b] == 0) {
+                continue;
+            }
+            std::fprintf(stderr,
+                         "METRIC_MAMBA_GEN %s seq %zu calls %zu total_ms %.3f avg_ms %.4f\n",
+                         names[b],
+                         last_seq[b],
+                         calls[b],
+                         ms[b],
+                         ms[b] / static_cast<double>(calls[b]));
+        }
+    }
+};
+
+MambaGenTimer &mamba_gen_timer() {
+    thread_local MambaGenTimer timer;
+    return timer;
+}
+
+} // namespace
 
 std::shared_ptr<infinilm::config::ModelConfig>
 create_mamba_model_config(std::shared_ptr<infinilm::config::ModelConfig> config) {
@@ -86,7 +151,23 @@ infinicore::Tensor MambaMixer::forward(const infinicore::Tensor &hidden_states) 
     auto c = ssm_params->narrow({{2, time_step_rank_ + state_size_, state_size_}})->contiguous();
     auto dt_in = time_step;
     auto dt = dt_proj_->forward(dt_in);
+    auto &mt = mamba_gen_timer();
+    MambaGenTimer::Entry mentry{};
+    infinirtStream_t mstream = mt.enabled ? infinicore::context::getStream() : nullptr;
+    if (mt.enabled) {
+        mt.capture_device();
+        const size_t seq = conv_out->size(1);
+        mentry.bucket = seq > 1 ? 0 : 1;
+        mentry.seq = seq;
+        infinirtEventCreate(&mentry.a);
+        infinirtEventCreate(&mentry.b);
+        infinirtEventRecord(mentry.a, mstream);
+    }
     auto scan = infinicore::op::mamba_selective_scan(conv_out, dt, b, c, A_log_, D_, gate, dt_bias_zero_, ssm_state);
+    if (mt.enabled) {
+        infinirtEventRecord(mentry.b, mstream);
+        mt.entries.push_back(mentry);
+    }
     auto scan_mut = scan;
     return out_proj_->forward(scan_mut);
 }
