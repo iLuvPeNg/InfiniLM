@@ -191,6 +191,18 @@ infinicore::Tensor upload_i32(const std::vector<int32_t> &data,
     return gpu;
 }
 
+// infiniop's sum() takes its parallel path only when the reduction covers the
+// whole input, so a [tokens, n] row reduction falls back to one thread per row
+// running a serial n-iteration loop: ~22 ms for n = 16384 as soon as tokens > 1.
+// The same row sums of squares come out of a GEMM against a column of ones in
+// ~0.05 ms at that shape, which is what the hyper-connection RMS scale needs.
+infinicore::Tensor row_sumsq(const infinicore::Tensor &x) {
+    auto ones = infinicore::Tensor::ones({x->size(1), size_t{1}},
+                                         infinicore::DataType::F32,
+                                         x->device());
+    return infinicore::op::matmul(infinicore::op::mul(x, x), ones);
+}
+
 infinicore::Tensor make_rope_cache(size_t max_pos,
                                    size_t rope_dim,
                                    double theta,
@@ -303,7 +315,7 @@ MhcOut mhc_pre(const infinicore::Tensor &residual,
     }
     auto fn_t = cast_dtype(fn_used, infinicore::DataType::F32)->permute({1, 0})->contiguous();
     auto gemm = infinicore::op::matmul(flat32, fn_t);
-    auto sumsq = infinicore::op::sum(infinicore::op::mul(flat32, flat32), {1}, false);
+    auto sumsq = row_sumsq(flat32);
     const auto gemm_cpu = download_f32(gemm);
     const auto sumsq_cpu = download_f32(sumsq);
     const auto scale_cpu = download_f32(scale);
@@ -398,7 +410,7 @@ infinicore::Tensor hc_head(const infinicore::Tensor &residual,
     auto flat32 = cast_dtype(residual->contiguous()->view({tokens, hc * hidden}), infinicore::DataType::F32);
     auto fn_t = cast_dtype(fn, infinicore::DataType::F32)->permute({1, 0})->contiguous();
     auto mixes = infinicore::op::matmul(flat32, fn_t);
-    auto sumsq = infinicore::op::sum(infinicore::op::mul(flat32, flat32), {1}, false);
+    auto sumsq = row_sumsq(flat32);
     const auto mix_cpu = download_f32(mixes);
     const auto sumsq_cpu = download_f32(sumsq);
     const auto scale_cpu = download_f32(scale);
