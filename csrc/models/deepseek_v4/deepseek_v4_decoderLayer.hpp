@@ -17,6 +17,8 @@ public:
                          const infinicore::DataType &dtype,
                          const infinicore::Device &device);
     infinicore::Tensor embed(int64_t token) const;
+    // Same lookup, but the id is already on the device.
+    infinicore::Tensor embed_tensor(const infinicore::Tensor &ids) const;
     infinicore::Tensor bias(const infinicore::Tensor &embed) const;
 
 private:

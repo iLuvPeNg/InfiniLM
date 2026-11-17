@@ -311,10 +311,98 @@ infinicore::Tensor DeepseekV4MoE::forward(infinicore::Tensor hidden, const std::
     const size_t tokens = x->size(0);
     const auto device = x->device();
     const auto dtype = x->dtype();
-    if (!gate_t_) {
-        gate_t_ = cast_dtype(gate_->route_weight()->permute({1, 0})->contiguous(), infinicore::DataType::F32);
+    std::vector<float> logits;
+    DeviceRoute routed;
+    {
+        GpuScope router_scope(GpuBucket::FfnRouter);
+        if (!gate_t_) {
+            gate_t_ = cast_dtype(gate_->route_weight()->permute({1, 0})->contiguous(), infinicore::DataType::F32);
+        }
+        auto router_out = infinicore::op::matmul(cast_dtype(x, infinicore::DataType::F32), gate_t_);
+        // Routing on the device removes the one host round trip this layer used
+        // to have; see device_moe_route() for the measurement. The host path
+        // below stays as the reference (INFINI_ROUTER_HOST=1) and for wide
+        // batches, where an extra row or two per expert is free.
+        static const bool router_host_forced = std::getenv("INFINI_ROUTER_HOST") != nullptr;
+        const size_t rows_cap = tokens * topk_;
+        auto bias_t = has_bias_ ? gate_->bias() : infinicore::Tensor{};
+        auto tid_t = hash_ ? gate_->tid2eid() : infinicore::Tensor{};
+        // Rows the device route may cover. Its scatter is a dense
+        // [tokens x rows_cap] matrix, so this also bounds that allocation; the
+        // host path stays for batches wider than this.
+        static const size_t route_rows_max = [] {
+            const char *env = std::getenv("INFINI_ROUTE_ROWS_MAX");
+            return env != nullptr ? static_cast<size_t>(std::strtoull(env, nullptr, 10)) : size_t{8192};
+        }();
+        if (!router_host_forced && rows_cap <= route_rows_max
+            && device_moe_route(router_out,
+                                bias_t ? &bias_t : nullptr,
+                                tid_t ? &tid_t : nullptr,
+                                token_ids,
+                                topk_,
+                                tp_size_,
+                                tp_rank_,
+                                hash_,
+                                renormalize_,
+                                routed_scale_,
+                                rows_cap,
+                                routed)) {
+            const size_t local_experts = w1_packed_->size(0);
+            infinicore::Tensor packed_act;
+            {
+                GpuScope gather_scope(GpuBucket::FfnQuant);
+                RouteRange gather_range("moe_route_gather");
+                packed_act = infinicore::op::embedding(routed.row_token, x);
+            }
+            auto act_i8 = infinicore::Tensor::empty({rows_cap, hidden_}, infinicore::DataType::I8, device);
+            auto act_scale = infinicore::Tensor::empty({rows_cap, size_t{1}}, infinicore::DataType::F32, device);
+            {
+                GpuScope quant_scope(GpuBucket::FfnQuant);
+                infinicore::op::per_channel_quant_i8_(packed_act, act_i8, act_scale);
+            }
+            auto gate = infinicore::Tensor::empty({rows_cap, intermediate_}, dtype, device);
+            auto up = infinicore::Tensor::empty({rows_cap, intermediate_}, dtype, device);
+            {
+                GpuScope gemm_scope(GpuBucket::FfnGemm);
+                device_group_gemm(gate, act_i8, w1_packed_->contiguous(), act_scale,
+                                  w1_scale_packed_->contiguous(), routed.counts, rows_cap, local_experts);
+                device_group_gemm(up, act_i8, w3_packed_->contiguous(), act_scale,
+                                  w3_scale_packed_->contiguous(), routed.counts, rows_cap, local_experts);
+            }
+            auto mid = swiglu_clamp(gate, up, swiglu_limit_);
+            auto mid_i8 = infinicore::Tensor::empty({rows_cap, intermediate_}, infinicore::DataType::I8, device);
+            auto mid_scale = infinicore::Tensor::empty({rows_cap, size_t{1}}, infinicore::DataType::F32, device);
+            {
+                GpuScope quant_scope(GpuBucket::FfnQuant);
+                infinicore::op::per_channel_quant_i8_(mid, mid_i8, mid_scale);
+            }
+            // The grouped GEMM writes only the rows the counts cover, so the
+            // tail rows have to start at zero for the scatter below.
+            auto down = infinicore::Tensor::zeros({rows_cap, hidden_}, dtype, device);
+            {
+                GpuScope gemm_scope(GpuBucket::FfnGemm);
+                device_group_gemm(down, mid_i8, w2_packed_->contiguous(), mid_scale,
+                                  w2_scale_packed_->contiguous(), routed.counts, rows_cap, local_experts);
+            }
+            infinicore::Tensor acc;
+            {
+                GpuScope scatter_scope(GpuBucket::FfnScatter);
+                RouteRange scatter_range("moe_route_scatter");
+                acc = infinicore::op::matmul(cast_dtype(routed.mix, dtype), down);
+            }
+            if (tp_size_ > 1 && comm_ != nullptr) {
+                GpuScope allreduce_scope(GpuBucket::FfnAllreduce);
+                infinicore::op::distributed::allreduce_(acc, acc, INFINICCL_SUM, comm_);
+            }
+            infinicore::Tensor shared;
+            {
+                GpuScope shared_scope(GpuBucket::FfnShared);
+                shared = shared_experts_->forward(x);
+            }
+            return infinicore::op::add(acc, shared);
+        }
+        logits = download_f32(router_out);
     }
-    auto logits = download_f32(infinicore::op::matmul(cast_dtype(x, infinicore::DataType::F32), gate_t_));
     if (logits.size() != tokens * n_experts_) {
         throw std::runtime_error("deepseek_v4 moe: router score size mismatch");
     }
@@ -417,6 +505,7 @@ infinicore::Tensor DeepseekV4MoE::forward(infinicore::Tensor hidden, const std::
         auto route_index = upload_i32(token_indices, {rows}, device);
         infinicore::Tensor packed_act;
         {
+            GpuScope gather_scope(GpuBucket::FfnQuant);
             RouteRange gather_range("moe_route_gather");
             packed_act = infinicore::op::embedding(route_index, x);
         }
@@ -432,7 +521,10 @@ infinicore::Tensor DeepseekV4MoE::forward(infinicore::Tensor hidden, const std::
         if (mt.enabled) {
             infinirtEventRecord(entry.q1.a, stream);
         }
-        infinicore::op::per_channel_quant_i8_(packed_act, act_i8, act_scale);
+        {
+            GpuScope quant_scope(GpuBucket::FfnQuant);
+            infinicore::op::per_channel_quant_i8_(packed_act, act_i8, act_scale);
+        }
         if (mt.enabled) {
             infinirtEventRecord(entry.q1.b, stream);
         }
@@ -441,8 +533,11 @@ infinicore::Tensor DeepseekV4MoE::forward(infinicore::Tensor hidden, const std::
         if (mt.enabled) {
             infinirtEventRecord(entry.g13.a, stream);
         }
-        infinicore::op::w4a8_group_gemm_(gate, act_i8, w1_packed_->contiguous(), act_scale, w1_scale_packed_->contiguous(), tokens_per_experts);
-        infinicore::op::w4a8_group_gemm_(up, act_i8, w3_packed_->contiguous(), act_scale, w3_scale_packed_->contiguous(), tokens_per_experts);
+        {
+            GpuScope gemm_scope(GpuBucket::FfnGemm);
+            infinicore::op::w4a8_group_gemm_(gate, act_i8, w1_packed_->contiguous(), act_scale, w1_scale_packed_->contiguous(), tokens_per_experts);
+            infinicore::op::w4a8_group_gemm_(up, act_i8, w3_packed_->contiguous(), act_scale, w3_scale_packed_->contiguous(), tokens_per_experts);
+        }
         if (mt.enabled) {
             infinirtEventRecord(entry.g13.b, stream);
         }
@@ -452,7 +547,10 @@ infinicore::Tensor DeepseekV4MoE::forward(infinicore::Tensor hidden, const std::
         if (mt.enabled) {
             infinirtEventRecord(entry.q2.a, stream);
         }
-        infinicore::op::per_channel_quant_i8_(mid, mid_i8, mid_scale);
+        {
+            GpuScope quant_scope(GpuBucket::FfnQuant);
+            infinicore::op::per_channel_quant_i8_(mid, mid_i8, mid_scale);
+        }
         if (mt.enabled) {
             infinirtEventRecord(entry.q2.b, stream);
         }
@@ -460,7 +558,10 @@ infinicore::Tensor DeepseekV4MoE::forward(infinicore::Tensor hidden, const std::
         if (mt.enabled) {
             infinirtEventRecord(entry.g2.a, stream);
         }
-        infinicore::op::w4a8_group_gemm_(down, mid_i8, w2_packed_->contiguous(), mid_scale, w2_scale_packed_->contiguous(), tokens_per_experts);
+        {
+            GpuScope gemm_scope(GpuBucket::FfnGemm);
+            infinicore::op::w4a8_group_gemm_(down, mid_i8, w2_packed_->contiguous(), mid_scale, w2_scale_packed_->contiguous(), tokens_per_experts);
+        }
         if (mt.enabled) {
             infinirtEventRecord(entry.g2.b, stream);
             infinirtEventRecord(entry.scatter.a, stream);
@@ -469,8 +570,9 @@ infinicore::Tensor DeepseekV4MoE::forward(infinicore::Tensor hidden, const std::
         for (size_t i = 0; i < rows; ++i) {
             route_mix[routes[i].token * rows + i] = route_weights[i];
         }
-        auto route_matrix = cast_dtype(upload_f32(route_mix, {tokens, rows}, device), dtype);
         {
+            GpuScope scatter_scope(GpuBucket::FfnScatter);
+            auto route_matrix = cast_dtype(upload_f32(route_mix, {tokens, rows}, device), dtype);
             RouteRange scatter_range("moe_route_scatter");
             acc = infinicore::op::matmul(route_matrix, down);
         }
@@ -480,9 +582,14 @@ infinicore::Tensor DeepseekV4MoE::forward(infinicore::Tensor hidden, const std::
         }
     }
     if (tp_size_ > 1 && comm_ != nullptr) {
+        GpuScope allreduce_scope(GpuBucket::FfnAllreduce);
         infinicore::op::distributed::allreduce_(acc, acc, INFINICCL_SUM, comm_);
     }
-    auto shared = shared_experts_->forward(x);
+    infinicore::Tensor shared;
+    {
+        GpuScope shared_scope(GpuBucket::FfnShared);
+        shared = shared_experts_->forward(x);
+    }
     return infinicore::op::add(acc, shared);
 }
 

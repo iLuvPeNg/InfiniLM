@@ -83,6 +83,8 @@ private:
     mutable std::vector<uint8_t> compressed_valid_;
     mutable std::vector<float> compress_norm_weight_;
     mutable std::vector<float> compress_ape_;
+    mutable infinicore::Tensor compress_norm_dev_;
+    mutable infinicore::Tensor compress_inv_freq_dev_;
     INFINICORE_NN_PARAMETER(attn_sink);
     INFINICORE_NN_MODULE(infinicore::nn::RMSNorm, q_norm);
     INFINICORE_NN_MODULE(infinicore::nn::RMSNorm, kv_norm);

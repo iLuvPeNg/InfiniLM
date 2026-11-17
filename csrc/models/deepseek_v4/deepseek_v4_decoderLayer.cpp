@@ -37,6 +37,14 @@ infinicore::Tensor DeepseekV4MarkovHead::embed(int64_t token) const {
     return out;
 }
 
+infinicore::Tensor DeepseekV4MarkovHead::embed_tensor(const infinicore::Tensor &ids) const {
+    const auto weight = markov_w1_->weight();
+    const size_t rank = weight->size(1);
+    auto out = infinicore::Tensor::empty({ids->numel(), rank}, weight->dtype(), weight->device());
+    infinicore::op::embedding_(out, ids->contiguous(), weight);
+    return out;
+}
+
 infinicore::Tensor DeepseekV4MarkovHead::bias(const infinicore::Tensor &embed) const {
     auto input = embed->contiguous();
     return markov_w2_->forward(input);
@@ -126,36 +134,73 @@ std::vector<int64_t> DeepseekV4DecoderLayer::sample_dspark_block(infinicore::Ten
     }
     const size_t vocab = logits->size(logits->ndim() - 1);
     const auto device = logits->device();
-    std::vector<int64_t> ids(static_cast<size_t>(block_size) + 1);
+    // The whole block stays on the device: step i+1 only needs the id that step
+    // i sampled, so the ids are written back into `ids` instead of being drained
+    // one at a time. One download at the end replaces block_size of them, which
+    // matters because every drain is a rendezvous across the TP ranks.
+    auto ids = infinicore::Tensor::empty({static_cast<size_t>(block_size) + 1},
+                                         infinicore::DataType::I64,
+                                         device);
+    {
+        auto anchor = infinicore::Tensor::empty({size_t{1}}, infinicore::DataType::I64, infinicore::Device::cpu());
+        std::memcpy(anchor->data(), &anchor_token, sizeof(anchor_token));
+        ids->narrow({{0, 0, 1}})->copy_from(anchor->to(device));
+    }
+    static const bool draft_ids_host = std::getenv("INFINI_DSPARK_IDS_HOST") != nullptr;
     std::vector<infinicore::Tensor> embeds;
-    ids[0] = anchor_token;
     embeds.reserve(static_cast<size_t>(block_size));
     for (int i = 0; i < block_size; ++i) {
-        auto embed = markov_head_->embed(ids[static_cast<size_t>(i)]);
+        auto id_t = ids->narrow({{0, static_cast<size_t>(i), 1}});
+        auto embed = draft_ids_host
+                         ? markov_head_->embed(download_i64(id_t).at(0))
+                         : markov_head_->embed_tensor(id_t);
         embeds.push_back(embed);
         auto scored = infinicore::op::add(logits->narrow({{0, static_cast<size_t>(i), 1}})->contiguous(), markov_head_->bias(embed));
         scored = scored->contiguous()->view({vocab});
-        auto index = infinicore::Tensor::empty({size_t{1}}, infinicore::DataType::I64, device)->view({});
-        infinicore::op::random_sample_(index, scored, 0.0f, 1.0f, 1, 1.0f);
-        ids[static_cast<size_t>(i) + 1] = download_i64(index).at(0);
+        auto index = infinicore::Tensor::empty({size_t{1}}, infinicore::DataType::I64, device);
+        infinicore::op::random_sample_(index->view({}), scored, 0.0f, 1.0f, 1, 1.0f);
+        ids->narrow({{0, static_cast<size_t>(i) + 1, 1}})->copy_from(index);
     }
     auto embed_cat = embeds.size() == 1 ? embeds[0] : infinicore::op::cat(embeds, 0);
     confidence_head_->score(collapsed, embed_cat);
-    return ids;
+    return download_i64(ids);
 }
 
 infinicore::Tensor DeepseekV4DecoderLayer::forward(infinicore::Tensor residual,
                                                    const std::vector<int64_t> &positions,
                                                    const std::vector<int64_t> &token_ids) const {
-    auto attn_mix = mhc_pre(residual, hc_attn_fn_, hc_attn_scale_, hc_attn_base_, hc_mult_, rms_eps_, hc_eps_, sinkhorn_iters_);
-    auto attn_normed = attn_norm_->forward(attn_mix.layer_input);
-    auto attn_out = attn_->forward(attn_normed, positions);
-    auto mid = mhc_post(attn_out, attn_mix.residual, attn_mix.post_mix, attn_mix.comb);
+    gpu_timer_set_decode(residual->size(0) == 1);
+    HostScope host_layer(HostBucket::Layer);
+    auto section = [](GpuBucket bucket, auto &&fn) {
+        GpuScope scope(bucket);
+        return fn();
+    };
+    GpuScope layer_scope(GpuBucket::Layer);
+    auto attn_mix = section(GpuBucket::MhcPreAttn, [&] {
+        return mhc_pre(residual, hc_attn_fn_, hc_attn_scale_, hc_attn_base_, hc_mult_, rms_eps_, hc_eps_, sinkhorn_iters_);
+    });
+    auto attn_normed = section(GpuBucket::AttnNorm, [&] {
+        return attn_norm_->forward(attn_mix.layer_input);
+    });
+    auto attn_out = section(GpuBucket::Attn, [&] {
+        return attn_->forward(attn_normed, positions);
+    });
+    auto mid = section(GpuBucket::MhcPostAttn, [&] {
+        return mhc_post(attn_out, attn_mix.residual, attn_mix.post_mix, attn_mix.comb);
+    });
 
-    auto ffn_mix = mhc_pre(mid, hc_ffn_fn_, hc_ffn_scale_, hc_ffn_base_, hc_mult_, rms_eps_, hc_eps_, sinkhorn_iters_);
-    auto ffn_normed = ffn_norm_->forward(ffn_mix.layer_input);
-    auto ffn_out = ffn_->forward(ffn_normed, token_ids);
-    return mhc_post(ffn_out, ffn_mix.residual, ffn_mix.post_mix, ffn_mix.comb);
+    auto ffn_mix = section(GpuBucket::MhcPreFfn, [&] {
+        return mhc_pre(mid, hc_ffn_fn_, hc_ffn_scale_, hc_ffn_base_, hc_mult_, rms_eps_, hc_eps_, sinkhorn_iters_);
+    });
+    auto ffn_normed = section(GpuBucket::FfnNorm, [&] {
+        return ffn_norm_->forward(ffn_mix.layer_input);
+    });
+    auto ffn_out = section(GpuBucket::Ffn, [&] {
+        return ffn_->forward(ffn_normed, token_ids);
+    });
+    return section(GpuBucket::MhcPostFfn, [&] {
+        return mhc_post(ffn_out, ffn_mix.residual, ffn_mix.post_mix, ffn_mix.comb);
+    });
 }
 
 } // namespace infinilm::models::deepseek_v4

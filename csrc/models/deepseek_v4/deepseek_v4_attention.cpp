@@ -304,15 +304,23 @@ infinicore::Tensor DeepseekV4Attention::forward(infinicore::Tensor hidden,
     const auto device = x->device();
     const auto dtype = x->dtype();
 
-    auto qa = q_norm_->forward(int8_gemm(x, wq_a_->weight(), wq_a_->weight_scale()));
-    auto q = int8_gemm(qa, wq_b_->weight(), wq_b_->weight_scale())->contiguous()->view({tokens, local_heads_, head_dim_});
-    auto ones = infinicore::Tensor::ones({head_dim_}, q->dtype(), device);
-    q = infinicore::op::rms_norm(q, ones, static_cast<float>(eps_));
-    auto kv = kv_norm_->forward(int8_gemm(x, wkv_->weight(), wkv_->weight_scale()))->contiguous();
+    infinicore::Tensor q;
+    infinicore::Tensor kv;
+    {
+        GpuScope qkv_scope(GpuBucket::AttnQkv);
+        auto qa = q_norm_->forward(int8_gemm(x, wq_a_->weight(), wq_a_->weight_scale()));
+        q = int8_gemm(qa, wq_b_->weight(), wq_b_->weight_scale())->contiguous()->view({tokens, local_heads_, head_dim_});
+        auto ones = infinicore::Tensor::ones({head_dim_}, q->dtype(), device);
+        q = infinicore::op::rms_norm(q, ones, static_cast<float>(eps_));
+        kv = kv_norm_->forward(int8_gemm(x, wkv_->weight(), wkv_->weight_scale()))->contiguous();
+    }
 
     ensure_rope_cache(cache_len, device);
-    q = apply_rope(q, positions, rope_cache_, head_dim_ - rope_dim_, rope_dim_, false);
-    kv = apply_rope(kv, positions, rope_cache_, head_dim_ - rope_dim_, rope_dim_, false);
+    {
+        GpuScope qkv_scope(GpuBucket::AttnQkv);
+        q = apply_rope(q, positions, rope_cache_, head_dim_ - rope_dim_, rope_dim_, false);
+        kv = apply_rope(kv, positions, rope_cache_, head_dim_ - rope_dim_, rope_dim_, false);
+    }
 
     int64_t origin = 0;
     if (contiguous_positions(positions, &origin)) {
@@ -324,6 +332,7 @@ infinicore::Tensor DeepseekV4Attention::forward(infinicore::Tensor hidden,
     }
 
     if (compressor_) {
+        GpuScope compressor_scope(GpuBucket::AttnCompressor);
         const int ratio = compressor_->compress_ratio();
         const size_t width = compressor_->state_width();
         const size_t head = compressor_->head_dim();
@@ -378,9 +387,35 @@ infinicore::Tensor DeepseekV4Attention::forward(infinicore::Tensor hidden,
                 slab_hi = std::max(slab_hi, pos);
             }
             const int64_t slab_n = slab_hi - slab_lo + 1;
-            auto slab = download_f32(state_cache->narrow({{0, static_cast<size_t>(slab_lo), static_cast<size_t>(slab_n)}}));
+            // The state rows, the online softmax and the norm/rope that turn them
+            // into a compressed row all live on the device now; the host loop
+            // below stays as the reference and as the fallback.
+            static const bool compress_host_forced = std::getenv("INFINI_COMPRESS_HOST") != nullptr;
+            if (!compress_norm_dev_) {
+                compress_norm_dev_ = cast_dtype(compressor_->norm_weight(), infinicore::DataType::F32)->contiguous();
+                compress_inv_freq_dev_ = upload_f32(rope_inv_freq_, {rope_inv_freq_.size()}, device);
+            }
+            infinicore::Tensor gpu_rows;
+            infinicore::Tensor emitted;
+            static const bool compress_check = std::getenv("INFINI_COMPRESS_CHECK") != nullptr;
+            const bool emit_on_device = !compress_host_forced
+                && device_compress_emit(state_cache,
+                                        static_cast<size_t>(slab_lo),
+                                        emit,
+                                        static_cast<size_t>(ratio),
+                                        static_cast<size_t>(n_ctx),
+                                        head,
+                                        width,
+                                        rope_dim_,
+                                        compress_norm_dev_,
+                                        compress_inv_freq_dev_,
+                                        static_cast<float>(eps_),
+                                        emitted);
+            std::vector<float> rows;
+            if (!emit_on_device || compress_check) {
+                auto slab = download_f32(state_cache->narrow({{0, static_cast<size_t>(slab_lo), static_cast<size_t>(slab_n)}}));
             const size_t stride = width * 2;
-            std::vector<float> rows(emit.size() * head, 0.0f);
+            rows.assign(emit.size() * head, 0.0f);
             for (size_t e = 0; e < emit.size(); ++e) {
                 const int64_t pos = emit[e];
                 const int64_t start = pos - n_ctx + 1;
@@ -427,7 +462,30 @@ infinicore::Tensor DeepseekV4Attention::forward(infinicore::Tensor hidden,
                 }
                 std::copy(acc.begin(), acc.end(), rows.begin() + static_cast<std::ptrdiff_t>(e * head));
             }
-            auto gpu_rows = cast_dtype(upload_f32(rows, {emit.size(), head}, device), dtype);
+            }
+            if (emit_on_device) {
+                gpu_rows = cast_dtype(emitted, dtype);
+                if (compress_check) {
+                    // Host rows above are the reference; report how far the
+                    // device emit moved them so a divergence can be told apart
+                    // from a wrong kernel.
+                    const auto ref = download_f32(emitted);
+                    float max_abs = 0.0f;
+                    float max_rel = 0.0f;
+                    for (size_t i = 0; i < rows.size(); ++i) {
+                        const float diff = std::fabs(rows[i] - ref[i]);
+                        max_abs = std::max(max_abs, diff);
+                        max_rel = std::max(max_rel, diff / std::max(std::fabs(rows[i]), 1e-30f));
+                    }
+                    std::fprintf(stderr,
+                                 "COMPRESS_CHECK emits %zu max_abs %.3e max_rel %.3e\n",
+                                 emit.size(),
+                                 max_abs,
+                                 max_rel);
+                }
+            } else {
+                gpu_rows = cast_dtype(upload_f32(rows, {emit.size(), head}, device), dtype);
+            }
             const int64_t first_slot = emit.front() / ratio;
             bool dense_slots = true;
             for (size_t e = 0; e < emit.size(); ++e) {
@@ -447,52 +505,74 @@ infinicore::Tensor DeepseekV4Attention::forward(infinicore::Tensor hidden,
     }
 
     const int ratio = compressor_ ? compressor_->compress_ratio() : 1;
-    size_t packed_rows = 0;
-    std::vector<size_t> swa_at(tokens, 0);
-    std::vector<size_t> swa_n(tokens, 0);
-    std::vector<size_t> cmp_at(tokens, 0);
-    std::vector<size_t> cmp_n(tokens, 0);
-    for (size_t t = 0; t < tokens; ++t) {
-        const int64_t pos = positions[t];
-        const int64_t begin = std::max<int64_t>(0, pos - sliding_window_ + 1);
-        swa_at[t] = static_cast<size_t>(begin);
-        swa_n[t] = static_cast<size_t>(pos - begin + 1);
-        packed_rows += swa_n[t];
-        if (compressor_) {
-            int64_t count = (pos + 1) / ratio;
-            int64_t keep = count;
-            if (index_topk_ > 0 && keep > index_topk_) {
-                keep = index_topk_;
-            }
-            cmp_at[t] = static_cast<size_t>(count - keep);
-            cmp_n[t] = static_cast<size_t>(keep);
-            packed_rows += cmp_n[t];
-        }
-    }
-    if (packed_rows == 0) {
-        throw std::runtime_error("deepseek_v4 attention: no keys for FlashMLA");
-    }
-    auto packed = infinicore::Tensor::empty({packed_rows, head_dim_}, dtype, device);
+    infinicore::Tensor packed;
     std::vector<size_t> starts(tokens, 0);
     std::vector<size_t> lens(tokens, 0);
-    size_t cursor = 0;
-    infinicore::Tensor compressed_cache;
-    if (compressor_) {
-        compressed_cache = cache_slot(layer_idx_, kCompressedCacheSlot);
-    }
-    for (size_t t = 0; t < tokens; ++t) {
-        starts[t] = cursor;
-        copy_rows(packed, cursor, swa_cache, swa_at[t], swa_n[t]);
-        cursor += swa_n[t];
-        if (cmp_n[t] > 0) {
-            copy_rows(packed, cursor, compressed_cache, cmp_at[t], cmp_n[t]);
-            cursor += cmp_n[t];
+    {
+        GpuScope pack_scope(GpuBucket::AttnPack);
+        size_t packed_rows = 0;
+        std::vector<size_t> swa_at(tokens, 0);
+        std::vector<size_t> swa_n(tokens, 0);
+        std::vector<size_t> cmp_at(tokens, 0);
+        std::vector<size_t> cmp_n(tokens, 0);
+        for (size_t t = 0; t < tokens; ++t) {
+            const int64_t pos = positions[t];
+            const int64_t begin = std::max<int64_t>(0, pos - sliding_window_ + 1);
+            swa_at[t] = static_cast<size_t>(begin);
+            swa_n[t] = static_cast<size_t>(pos - begin + 1);
+            packed_rows += swa_n[t];
+            if (compressor_) {
+                int64_t count = (pos + 1) / ratio;
+                int64_t keep = count;
+                if (index_topk_ > 0 && keep > index_topk_) {
+                    keep = index_topk_;
+                }
+                cmp_at[t] = static_cast<size_t>(count - keep);
+                cmp_n[t] = static_cast<size_t>(keep);
+                packed_rows += cmp_n[t];
+            }
         }
-        lens[t] = cursor - starts[t];
+        if (packed_rows == 0) {
+            throw std::runtime_error("deepseek_v4 attention: no keys for FlashMLA");
+        }
+        packed = infinicore::Tensor::empty({packed_rows, head_dim_}, dtype, device);
+        size_t cursor = 0;
+        infinicore::Tensor compressed_cache;
+        if (compressor_) {
+            compressed_cache = cache_slot(layer_idx_, kCompressedCacheSlot);
+        }
+        static const bool pack_host_forced = std::getenv("INFINI_ATTN_PACK_HOST") != nullptr;
+        bool packed_on_device = false;
+        if (!pack_host_forced) {
+            // Row layout first (starts/lens), then one gather launch for every
+            // token's window rows; the loop below is the per-copy reference.
+            for (size_t t = 0; t < tokens; ++t) {
+                starts[t] = cursor;
+                lens[t] = swa_n[t] + cmp_n[t];
+                cursor += lens[t];
+            }
+            packed_on_device = device_attn_pack(packed, swa_cache, compressor_ ? &compressed_cache : nullptr,
+                                                starts, swa_at, swa_n, cmp_at, cmp_n);
+        }
+        if (!packed_on_device) {
+            cursor = 0;
+            for (size_t t = 0; t < tokens; ++t) {
+                starts[t] = cursor;
+                copy_rows(packed, cursor, swa_cache, swa_at[t], swa_n[t]);
+                cursor += swa_n[t];
+                if (cmp_n[t] > 0) {
+                    copy_rows(packed, cursor, compressed_cache, cmp_at[t], cmp_n[t]);
+                    cursor += cmp_n[t];
+                }
+                lens[t] = cursor - starts[t];
+            }
+        }
     }
     auto query = q->contiguous();
     auto sink = attn_sink_->contiguous();
     auto attn = infinicore::Tensor::empty({tokens, local_heads_, head_dim_}, dtype, device);
+    {
+    GpuScope flash_scope(GpuBucket::AttnFlash);
     if (device.getType() == infinicore::Device::Type::ILUVATAR) {
         std::vector<int32_t> row_starts(tokens);
         std::vector<int32_t> row_lens(tokens);
@@ -523,22 +603,28 @@ infinicore::Tensor DeepseekV4Attention::forward(infinicore::Tensor hidden,
             attn->narrow({{0, t, 1}})->view({local_heads_, head_dim_})->copy_from(out_t);
         }
     }
-
-    auto mixed = apply_rope(attn, positions, rope_cache_, head_dim_ - rope_dim_, rope_dim_, true);
-    const size_t heads_per_group = local_heads_ / local_groups_;
-    const size_t group_in = heads_per_group * head_dim_;
-    std::vector<infinicore::Tensor> parts;
-    parts.reserve(local_groups_);
-    for (size_t group = 0; group < local_groups_; ++group) {
-        auto slice = mixed->narrow({{1, group * heads_per_group, heads_per_group}})->contiguous()->view({tokens, group_in});
-        auto weight = wo_a_->weight()->narrow({{0, group * o_lora_, o_lora_}})->contiguous();
-        auto weight_scale = wo_a_->weight_scale()->narrow({{0, group * o_lora_, o_lora_}})->contiguous();
-        parts.push_back(int8_gemm(slice, weight, weight_scale));
     }
-    auto latent = parts.size() == 1 ? parts[0] : infinicore::op::cat(parts, 1);
-    auto out = int8_gemm(latent, wo_b_->weight(), wo_b_->weight_scale());
+
+    infinicore::Tensor out;
+    {
+        GpuScope proj_scope(GpuBucket::AttnProj);
+        auto mixed = apply_rope(attn, positions, rope_cache_, head_dim_ - rope_dim_, rope_dim_, true);
+        const size_t heads_per_group = local_heads_ / local_groups_;
+        const size_t group_in = heads_per_group * head_dim_;
+        std::vector<infinicore::Tensor> parts;
+        parts.reserve(local_groups_);
+        for (size_t group = 0; group < local_groups_; ++group) {
+            auto slice = mixed->narrow({{1, group * heads_per_group, heads_per_group}})->contiguous()->view({tokens, group_in});
+            auto weight = wo_a_->weight()->narrow({{0, group * o_lora_, o_lora_}})->contiguous();
+            auto weight_scale = wo_a_->weight_scale()->narrow({{0, group * o_lora_, o_lora_}})->contiguous();
+            parts.push_back(int8_gemm(slice, weight, weight_scale));
+        }
+        auto latent = parts.size() == 1 ? parts[0] : infinicore::op::cat(parts, 1);
+        out = int8_gemm(latent, wo_b_->weight(), wo_b_->weight_scale());
+    }
     const auto &rank_info = infinilm::global_state::get_tensor_model_parallel_rank_info();
     if (rank_info.tp_size > 1 && rank_info.comm != nullptr) {
+        GpuScope ar_scope(GpuBucket::AttnAllreduce);
         infinicore::op::distributed::allreduce_(out, out, INFINICCL_SUM, rank_info.comm);
     }
     return out;

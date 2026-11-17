@@ -234,6 +234,7 @@ infinilm::InfinilmModel::Output DeepseekV4ForCausalLM::forward(const Input &inpu
             }
         }
     }
+    gpu_timer_flush_thread();
     return {logits_view, draft_ids};
 }
 
